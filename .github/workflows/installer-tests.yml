@@ -29,6 +29,23 @@ jobs:
       # `irm | iex` into whatever shell the user already has, and 5.1 is what
       # ships with Windows. A construct that only parses under 7 is a broken
       # installer for most of the people hitting it.
+      # Temporary diagnostic: run the installer directly with an aliased
+      # profile and show everything it emits, merged. Removed once the
+      # Windows behavior is pinned down.
+      - name: DIAG - direct run, merged output
+        shell: pwsh
+        run: |
+          $env:USERPROFILE = 'C:\Users\FIRST~1.LAS'
+          $env:TEMP = 'C:\Users\FIRST~1.LAS\AppData\Local\Temp'
+          Write-Host "--- merged (2>&1) ---"
+          pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/install.ps1 -ProtocolVersion 2>&1 | ForEach-Object { "OUT: $_" }
+          Write-Host "--- exit: $LASTEXITCODE ---"
+          Write-Host "--- stderr only, to a file ---"
+          pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/install.ps1 -ProtocolVersion 2>diag-stderr.txt 1>diag-stdout.txt
+          Write-Host "stdout file:"; Get-Content diag-stdout.txt -ErrorAction SilentlyContinue
+          Write-Host "stderr file:"; Get-Content diag-stderr.txt -ErrorAction SilentlyContinue
+          Write-Host "--- done ---"
+
       - name: 8.3 short-path normalization (pwsh 7)
         shell: pwsh
         run: pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/tests/test-install-ps1-longpath.ps1
