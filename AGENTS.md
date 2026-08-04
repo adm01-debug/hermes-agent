@@ -1342,8 +1342,7 @@ host, not by patching `sys.platform`.
 @pytest.mark.windows_only
 ```
 
-Things are host-independent can stay unmarked:
-unmarked:
+Things that are host-independent can stay unmarked:
 
 - **Pure functions that take a platform as data** —
   `hidden_windows_child_options(opts, is_windows=True)` is input→output, not a
@@ -1356,6 +1355,18 @@ The line: **if the test needs the interpreter to believe it is on another OS
 in order to pass, it belongs on that OS.**
 When one test body walks several platforms in sequence, split it.
 Keep the host-native arm on the Linux lane and move the other arm into its own marked test.
+
+**Use the marker, never a bare `skipif`.** `scripts/ci/list_os_marked_tests.py`
+decides which files the macOS/Windows lanes import by grepping for the marker
+*name*, and the lane then filters with `-m <marker>`. A test gated with
+`@pytest.mark.skipif(sys.platform != "win32")` therefore skips on Linux AND is
+never imported on the Windows lane — it runs on no host at all, silently. The
+same trap catches a file-local alias (`windows_only = pytest.mark.skipif(...)`):
+the grep matches the name, so the file *is* listed, but `-m windows_only`
+deselects every test in it and the lane reports green over zero coverage.
+Equally, don't `pytest.skip()` the non-host rows of a `@parametrize` over
+platforms — split it into one marked test per OS, or only the host's row ever
+executes.
 
 ### Don't write change-detector tests
 

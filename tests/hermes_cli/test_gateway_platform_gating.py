@@ -17,7 +17,7 @@ import pytest
 
 class TestMatrixHiddenOnWindows:
     @pytest.mark.linux_only
-    def test_matrix_present_on_linux(self, monkeypatch):
+    def test_matrix_present_on_linux(self):
         """Sanity: matrix is still in the picker on Linux.
 
         Linux-gated because the assertion is the negative of the Windows
@@ -30,7 +30,7 @@ class TestMatrixHiddenOnWindows:
         assert "matrix" in keys, "matrix must be available on Linux"
 
     @pytest.mark.windows_only
-    def test_matrix_absent_on_windows(self, monkeypatch):
+    def test_matrix_absent_on_windows(self):
         """The gate itself: matrix must be dropped on a real Windows host.
 
         A patched ``sys.platform`` proved only that the ``if`` branch runs;
@@ -44,7 +44,7 @@ class TestMatrixHiddenOnWindows:
         assert "matrix" not in keys, "matrix must be hidden on Windows"
 
     @pytest.mark.windows_only
-    def test_other_platforms_unaffected_on_windows(self, monkeypatch):
+    def test_other_platforms_unaffected_on_windows(self):
         """Gating must only drop matrix, not collateral damage."""
         import hermes_cli.gateway as gateway_mod
 

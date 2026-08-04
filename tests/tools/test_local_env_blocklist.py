@@ -605,7 +605,7 @@ class TestHermesBinDirOnPath:
         local_mod._HERMES_BIN_DIR = None
         assert local_mod._prepend_hermes_bin_dir("/usr/bin:/bin") == "/usr/bin:/bin"
 
-    def test_make_run_env_injects_hermes_bin_dir(self, monkeypatch):
+    def test_make_run_env_injects_hermes_bin_dir(self):
         """A gateway env missing the hermes dir gets it back in the subshell PATH.
 
         Platform-agnostic: ``_prepend_hermes_bin_dir`` uses ``os.pathsep`` on

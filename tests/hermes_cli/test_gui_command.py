@@ -271,27 +271,49 @@ def test_electron_dist_ok_on_this_host():
         assert cli_main._electron_dist_ok(root) is True
 
 
-@pytest.mark.parametrize(
-    "host_platform,rel",
-    [
-        ("linux", "dist/electron"),
-        ("win32", "dist/electron.exe"),
-        ("darwin", "dist/Electron.app/Contents/MacOS/Electron"),
-    ],
-)
-def test_electron_dist_binary_basename_per_platform(host_platform, rel):
-    """Pin the per-OS basename table without faking the host.
+@pytest.mark.linux_only
+def test_electron_dist_binary_basename_linux():
+    """``dist/electron`` on Linux — asserted against the live function.
 
-    ``_electron_dist_binary`` is the only platform-dependent part, and its
-    output is a pure function of (project_root, platform) — so the mapping can
-    be asserted as data. Only the arm matching the real host is checked
-    against the live function; the rest document the table.
+    Split per-OS rather than parametrized over a platform table: the old
+    ``@parametrize(("linux", …), ("win32", …), ("darwin", …))`` skipped the two
+    non-host rows, so outside the Linux lane those two branches were asserted
+    nowhere at all. One marked test per OS puts each row on the lane that can
+    actually execute it.
     """
-    if sys.platform != host_platform:
-        pytest.skip(f"table entry for {host_platform}; host is {sys.platform}")
     root = Path("/tmp/does-not-need-to-exist")
-    binp = cli_main._electron_dist_binary(root)
-    assert binp == root / "node_modules" / "electron" / Path(rel)
+    assert cli_main._electron_dist_binary(root) == (
+        root / "node_modules" / "electron" / "dist" / "electron"
+    )
+
+
+@pytest.mark.windows_only
+def test_electron_dist_binary_basename_windows():
+    """``dist/electron.exe`` on Windows — the ``.exe`` suffix is the whole point."""
+    root = Path("C:/does-not-need-to-exist")
+    assert cli_main._electron_dist_binary(root) == (
+        root / "node_modules" / "electron" / "dist" / "electron.exe"
+    )
+
+
+@pytest.mark.macos_only
+def test_electron_dist_binary_basename_macos():
+    """``dist/Electron.app/Contents/MacOS/Electron`` on macOS.
+
+    The nested ``.app`` bundle path is why #47266's "dist exists but the
+    binary doesn't" check can't just stat the dist directory.
+    """
+    root = Path("/tmp/does-not-need-to-exist")
+    assert cli_main._electron_dist_binary(root) == (
+        root
+        / "node_modules"
+        / "electron"
+        / "dist"
+        / "Electron.app"
+        / "Contents"
+        / "MacOS"
+        / "Electron"
+    )
 
 
 

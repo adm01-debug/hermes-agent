@@ -13,7 +13,6 @@ bundle and refuses stubs.
 import shutil
 import ssl
 import subprocess
-import sys
 from pathlib import Path
 
 import pytest
@@ -50,7 +49,7 @@ def real_bundle_file(tmp_path: Path) -> str:
 
 class TestDefaultVerify:
     @pytest.mark.macos_only
-    def test_returns_ssl_context_on_darwin(self, monkeypatch):
+    def test_returns_ssl_context_on_darwin(self):
         result = _default_verify()
         assert isinstance(result, ssl.SSLContext)
 

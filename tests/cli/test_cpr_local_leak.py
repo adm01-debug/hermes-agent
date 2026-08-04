@@ -34,7 +34,7 @@ class TestClassicCliOutputSelection:
 
 
     @pytest.mark.windows_only
-    def test_windows_preserves_default_output_selection(self, monkeypatch):
+    def test_windows_preserves_default_output_selection(self):
         assert _terminal_may_leak_cpr() is False
         assert _select_classic_cli_pt_output(sys.stdout) is None
 

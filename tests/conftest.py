@@ -1035,20 +1035,12 @@ def pytest_configure(config):  # noqa: D401 — pytest hook
         f"{_ALLOW_MACOS_KEYCHAIN_MARK}: allow a test to exercise the macOS "
         "Keychain credential reader with its own subprocess/platform mocks.",
     )
-    config.addinivalue_line(
-        "markers",
-        "linux_only: exercises Linux-specific behaviour; skipped on other hosts.",
-    )
-    config.addinivalue_line(
-        "markers",
-        "macos_only: exercises macOS-specific behaviour; skipped on other "
-        "hosts. Run on the dedicated macOS CI job.",
-    )
-    config.addinivalue_line(
-        "markers",
-        "windows_only: exercises native-Windows behaviour; skipped on other "
-        "hosts. Run on the dedicated Windows CI job.",
-    )
+    # NOTE: linux_only / macos_only / windows_only are declared in
+    # pyproject.toml's ``markers`` list, not here — they are part of the
+    # project's public marker vocabulary (``pytest --markers``, and the CI
+    # lanes select on them), whereas the marks above are conftest-internal
+    # guards. Declaring them in both places just meant two descriptions that
+    # could drift apart.
 
     # The pyproject addopts pin ``--timeout-method=signal`` relies on
     # ``signal.SIGALRM``, which does not exist on Windows — pytest-timeout

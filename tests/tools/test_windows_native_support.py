@@ -424,7 +424,7 @@ class TestSubprocessCompatHelpers:
 
 
     @pytest.mark.windows_only
-    def test_windows_detach_flags_exclude_detached_process(self, monkeypatch):
+    def test_windows_detach_flags_exclude_detached_process(self):
         """DETACHED_PROCESS must stay OUT of every detach bundle.
 
         ``windows_only`` (with ``IS_WINDOWS`` no longer patched): the helpers
@@ -452,7 +452,7 @@ class TestSubprocessCompatHelpers:
         )
 
     @pytest.mark.windows_only
-    def test_windows_detach_flags_includes_breakaway_from_job(self, monkeypatch):
+    def test_windows_detach_flags_includes_breakaway_from_job(self):
         """CREATE_BREAKAWAY_FROM_JOB is load-bearing for the GUI-driven update path.
 
         Without it, the gateway-respawn watcher spawned by ``hermes update``
@@ -474,9 +474,7 @@ class TestSubprocessCompatHelpers:
         )
 
     @pytest.mark.windows_only
-    def test_windows_detach_flags_without_breakaway_drops_only_that_bit(
-        self, monkeypatch
-    ):
+    def test_windows_detach_flags_without_breakaway_drops_only_that_bit(self):
         """Fallback retry payload for restrictive job objects.
 
         Some Windows Terminal / container / kiosk configurations refuse
@@ -724,7 +722,7 @@ class TestLocalEnvironmentPathInjectionGated:
     """Sane PATH completion must stay POSIX-only."""
 
     @pytest.mark.windows_only
-    def test_windows_path_is_left_unchanged(self, monkeypatch):
+    def test_windows_path_is_left_unchanged(self):
         """``windows_only``: the assertion is that a real Windows ``PATH``
         (``;``-separated, drive-lettered) comes back untouched. On Linux the
         old ``_IS_WINDOWS`` patch made the function return early without ever
