@@ -4503,6 +4503,13 @@ class TurnRunner:
             and _peek_cached_sid != ctx.session_id
         ):
             try:
+                # Intentionally uses the default treat_missing_as_ended=False:
+                # this is a cache-eviction self-heal, not delete routing. A
+                # session deleted from state.db is handled by the routing
+                # staleness path in SessionStore.get_or_create_session
+                # (db_persisted + row-missing); here a missing row just means
+                # the cached entry is stale and the eviction below is still
+                # correct either way.
                 _cached_sid_is_dead = self._runner.session_store._is_session_ended_in_db(
                     _peek_cached_sid
                 )

@@ -3443,7 +3443,10 @@ class APIServerAdapter(BasePlatformAdapter):
         if err:
             return err
         db = await self._ensure_session_db_async()
-        deleted = await asyncio.to_thread(db.delete_session, session_id)
+        from hermes_constants import get_hermes_home
+
+        sessions_dir = Path(get_hermes_home()) / "sessions"
+        deleted = await asyncio.to_thread(db.delete_session, session_id, sessions_dir)
         return web.json_response({"object": "hermes.session.deleted", "id": session_id, "deleted": bool(deleted)})
 
     async def _handle_session_messages(self, request: "web.Request") -> "web.Response":

@@ -3056,6 +3056,64 @@ class TestDeleteSessionEndpoint:
         assert resp.status_code == 200
         assert resp.json().get("ok") is True
 
+    def test_delete_purges_gateway_routing_and_sessions_json(self):
+        """The sessions_dir fix: DELETE /api/sessions/{id} must also purge
+        the session's gateway_routing row and its sessions.json mirror entry.
+
+        The gateway rehydrates its routing index from state.db
+        (``gateway_routing`` table) and the legacy ``<sessions_dir>/
+        sessions.json`` mirror; a stale entry in either store resurrects the
+        dead session id on the next start or structural save. The endpoint
+        passes ``sessions_dir`` through to ``delete_session``, which scrubs
+        both.
+        """
+        import json as _json
+
+        from hermes_constants import get_hermes_home
+        from hermes_state import SessionDB
+
+        sid = "purge-me-single"
+        session_key = "agent:main:telegram:dm:purge-single"
+        sessions_dir = get_hermes_home() / "sessions"
+        scope = str(sessions_dir.resolve())
+        sessions_json = sessions_dir / "sessions.json"
+
+        db = SessionDB()
+        try:
+            db.create_session(session_id=sid, source="cli", session_key=session_key)
+            db.save_gateway_routing_entry(
+                session_key, _json.dumps({"session_id": sid}), scope=scope
+            )
+        finally:
+            db.close()
+        sessions_json.write_text(
+            _json.dumps(
+                {
+                    "_README": "sentinel",
+                    session_key: _json.dumps({"session_id": sid}),
+                    "agent:main:telegram:dm:purge-survivor": _json.dumps(
+                        {"session_id": "live-survivor"}
+                    ),
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        resp = self.auth_client.delete(f"/api/sessions/{sid}")
+        assert resp.status_code == 200
+        assert resp.json().get("ok") is True
+
+        db = SessionDB()
+        try:
+            assert db.get_session(sid) is None
+            assert db.load_gateway_routing_entries(scope=scope) == {}
+        finally:
+            db.close()
+        data = _json.loads(sessions_json.read_text(encoding="utf-8"))
+        assert session_key not in data
+        assert data["_README"] == "sentinel"
+        assert "agent:main:telegram:dm:purge-survivor" in data
+
 
 class TestBulkDeleteSessionsEndpoint:
     """Tests for ``POST /api/sessions/bulk-delete`` — backs the
@@ -3140,6 +3198,68 @@ class TestBulkDeleteSessionsEndpoint:
             "being shadowed by /api/sessions/{session_id} — check "
             "registration order in hermes_cli/web_server.py."
         )
+
+    def test_bulk_delete_purges_gateway_routing_and_sessions_json(self):
+        """The sessions_dir fix: bulk delete must purge each removed
+        session's gateway_routing row and sessions.json mirror entry,
+        while leaving non-deleted routing keys intact."""
+        import json as _json
+
+        from hermes_constants import get_hermes_home
+        from hermes_state import SessionDB
+
+        sessions_dir = get_hermes_home() / "sessions"
+        scope = str(sessions_dir.resolve())
+        sessions_json = sessions_dir / "sessions.json"
+
+        keys = {
+            "bulk-a": "agent:main:telegram:dm:bulk-a",
+            "bulk-b": "agent:main:telegram:dm:bulk-b",
+            "bulk-c": "agent:main:telegram:dm:bulk-c",
+        }
+        db = SessionDB()
+        try:
+            for sid, key in keys.items():
+                db.create_session(session_id=sid, source="cli", session_key=key)
+                db.save_gateway_routing_entry(
+                    key, _json.dumps({"session_id": sid}), scope=scope
+                )
+        finally:
+            db.close()
+        sessions_json.write_text(
+            _json.dumps(
+                {
+                    "_README": "sentinel",
+                    **{
+                        key: _json.dumps({"session_id": sid})
+                        for sid, key in keys.items()
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        resp = self.auth_client.post(
+            "/api/sessions/bulk-delete", json={"ids": ["bulk-a", "bulk-b"]}
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {"ok": True, "deleted": 2}
+
+        db = SessionDB()
+        try:
+            assert db.get_session("bulk-c") is not None
+            remaining = db.load_gateway_routing_entries(scope=scope)
+        finally:
+            db.close()
+        assert keys["bulk-a"] not in remaining
+        assert keys["bulk-b"] not in remaining
+        assert keys["bulk-c"] in remaining
+
+        data = _json.loads(sessions_json.read_text(encoding="utf-8"))
+        assert keys["bulk-a"] not in data
+        assert keys["bulk-b"] not in data
+        assert keys["bulk-c"] in data
+        assert data["_README"] == "sentinel"
 
 
 class TestDeleteEmptySessionsEndpoint:
