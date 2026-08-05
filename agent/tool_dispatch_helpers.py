@@ -5,6 +5,7 @@ Pure module-level utilities extracted from ``run_agent.py``:
 * ``_is_destructive_command`` — terminal-command heuristic used to gate
   parallel batch dispatch.
 * ``_should_parallelize_tool_batch`` / ``_extract_parallel_scope_path`` /
+  ``_extract_parallel_scope_paths`` / ``_extract_v4a_patch_paths`` /
   ``_paths_overlap`` — the rules engine deciding when a multi-tool batch
   can run concurrently.
 * ``_is_multimodal_tool_result`` / ``_multimodal_text_summary`` /
@@ -59,6 +60,20 @@ _PARALLEL_SAFE_TOOLS = frozenset({
 
 # File tools can run concurrently when they target independent paths.
 _PATH_SCOPED_TOOLS = frozenset({"read_file", "write_file", "patch"})
+
+# V4A multi-file patch headers (mirrors tools/file_tools.patch_tool, which
+# mirrors tools/patch_parser). ``\s*`` after ``***`` keeps parity with
+# patch_parser's leniency: ``***Update File:`` with no space parses, applies,
+# and must therefore also be detected here.
+_V4A_FILE_HEADER_RE = re.compile(
+    r"^\*\*\*\s*(?:Update|Add|Delete)\s+File:\s*(.+)$",
+    re.MULTILINE,
+)
+# ``*** Move File: <src> -> <dst>`` — both endpoints are mutation targets.
+_V4A_MOVE_HEADER_RE = re.compile(
+    r"^\*\*\*\s*Move\s+File:\s*(.+?)\s*->\s*(.+)$",
+    re.MULTILINE,
+)
 
 # Patterns that indicate a terminal command may modify/delete files.
 _DESTRUCTIVE_PATTERNS = re.compile(
@@ -117,9 +132,12 @@ def _plan_tool_batch_segments(tool_calls, *, execution_cwd: Optional[Path] = Non
     * ``_NEVER_PARALLEL_TOOLS`` (interactive tools) → barrier.
     * Unparseable / non-dict arguments → barrier.
     * Path-scoped tools (``read_file``/``write_file``/``patch``) join a
-      parallel run only when their target path does not overlap another
+      parallel run only when none of their target paths overlap another
       path already reserved in the same run; an overlap closes the run so
       the conflicting call starts a NEW run after the first completes.
+      For ``patch`` in V4A multi-file mode every path declared in the
+      patch body headers is reserved, so two V4A patches sharing a file
+      never run concurrently.
     * Anything not in ``_PARALLEL_SAFE_TOOLS`` and not an opted-in MCP
       tool → barrier.
 
@@ -173,15 +191,21 @@ def _plan_tool_batch_segments(tool_calls, *, execution_cwd: Optional[Path] = Non
             continue
 
         if tool_name in _PATH_SCOPED_TOOLS:
-            scoped_path = _extract_parallel_scope_path(tool_name, function_args, execution_cwd=execution_cwd)
-            if scoped_path is None:
+            scoped_paths = _extract_parallel_scope_paths(
+                tool_name, function_args, execution_cwd=execution_cwd
+            )
+            if not scoped_paths:
                 _add_sequential(tool_call)
                 continue
-            if any(_paths_overlap(scoped_path, existing) for existing in reserved_paths):
+            if any(
+                _paths_overlap(scoped_path, existing)
+                for scoped_path in scoped_paths
+                for existing in reserved_paths
+            ):
                 # Same-subtree conflict inside this run: close it so this
                 # call starts a fresh run AFTER the conflicting one lands.
                 _close_parallel()
-            reserved_paths.append(scoped_path)
+            reserved_paths.extend(scoped_paths)
             current.append(tool_call)
             continue
 
@@ -233,26 +257,102 @@ def _canonical_path(raw_path: str, execution_cwd: Optional[Path] = None) -> Path
     return Path(resolved)
 
 
-def _extract_parallel_scope_path(
+def _extract_v4a_patch_paths(patch_body: str) -> List[str]:
+    """Return the target paths declared in a V4A multi-file patch body.
+
+    Header syntax mirrors ``tools/file_tools.patch_tool`` (which in turn
+    mirrors ``tools/patch_parser``): ``*** Update File: <path>`` /
+    ``*** Add File: <path>`` / ``*** Delete File: <path>``, plus
+    ``*** Move File: <src> -> <dst>`` where BOTH endpoints are targets.
+    The ``\\s*`` after ``***`` keeps parity with patch_parser's leniency
+    (a ``***Update File:`` header with no space parses and applies).
+
+    Returns an empty list when the body is missing or declares no headers.
+    """
+    if not isinstance(patch_body, str) or not patch_body:
+        return []
+    paths: List[str] = []
+    for _m in _V4A_FILE_HEADER_RE.finditer(patch_body):
+        p = _m.group(1).strip()
+        if p:
+            paths.append(p)
+    for _m in _V4A_MOVE_HEADER_RE.finditer(patch_body):
+        src = _m.group(1).strip()
+        dst = _m.group(2).strip()
+        if src:
+            paths.append(src)
+        if dst:
+            paths.append(dst)
+    return paths
+
+
+def _extract_parallel_scope_paths(
     tool_name: str,
     function_args: dict,
     execution_cwd: Optional[Path] = None,
-) -> Optional[Path]:
-    """Return the canonical file target for path-scoped tools.
+) -> Optional[List[Path]]:
+    """Return the canonical file targets a path-scoped call will touch.
+
+    ``read_file`` / ``write_file`` / ``patch`` in replace mode target a
+    single file taken from ``args["path"]``.  ``patch`` in V4A mode
+    (``mode="patch"``) can touch many files declared in the patch body
+    headers (``*** Update File:`` etc.), so every declared path is
+    returned — the segment planner reserves all of them so two V4A
+    patches that share a file never run concurrently.
 
     *execution_cwd* should be the working directory that the tool will
     actually use at runtime.  When omitted the process cwd is used,
     which may differ from the tool execution environment on some
     platforms (e.g. WSL, sandboxed sub-processes).
+
+    Returns ``None`` — which the planner treats as a sequential barrier —
+    when the call has no usable scope: a missing/invalid ``args["path"]``
+    for the single-path tools, or a V4A body that is missing, unparseable,
+    or declares no headers (we cannot know which files such a patch would
+    touch, so we refuse to parallelize it).
     """
     if tool_name not in _PATH_SCOPED_TOOLS:
         return None
+
+    if tool_name == "patch" and (function_args.get("mode") or "replace") == "patch":
+        raw_paths = _extract_v4a_patch_paths(function_args.get("patch"))
+        if not raw_paths:
+            return None
+        # patch_tool also treats an explicit ``path`` arg as a target in
+        # V4A mode (file_tools.patch_tool checks it alongside the headers).
+        explicit = function_args.get("path")
+        if isinstance(explicit, str) and explicit.strip():
+            raw_paths.append(explicit)
+        canonical: List[Path] = []
+        seen: set[Path] = set()
+        for raw in raw_paths:
+            p = _canonical_path(raw, execution_cwd)
+            if p not in seen:
+                seen.add(p)
+                canonical.append(p)
+        return canonical
 
     raw_path = function_args.get("path")
     if not isinstance(raw_path, str) or not raw_path.strip():
         return None
 
-    return _canonical_path(raw_path, execution_cwd)
+    return [_canonical_path(raw_path, execution_cwd)]
+
+
+def _extract_parallel_scope_path(
+    tool_name: str,
+    function_args: dict,
+    execution_cwd: Optional[Path] = None,
+) -> Optional[Path]:
+    """Backward-compatible single-path view of ``_extract_parallel_scope_paths``.
+
+    Returns the first canonical target (for multi-file V4A patches that is
+    the first header path), or ``None`` when the call has no usable path.
+    """
+    paths = _extract_parallel_scope_paths(
+        tool_name, function_args, execution_cwd=execution_cwd
+    )
+    return paths[0] if paths else None
 
 
 def _paths_overlap(left: Path, right: Path) -> bool:
@@ -350,30 +450,7 @@ def _extract_file_mutation_targets(tool_name: str, args: Dict[str, Any]) -> List
         p = args.get("path")
         return [str(p)] if p else []
     if mode == "patch":
-        body = args.get("patch") or ""
-        if not isinstance(body, str) or not body:
-            return []
-        paths: List[str] = []
-        for _m in re.finditer(
-            r'^\*\*\*\s+(?:Update|Add|Delete)\s+File:\s*(.+)$',
-            body,
-            re.MULTILINE,
-        ):
-            p = _m.group(1).strip()
-            if p:
-                paths.append(p)
-        for _m in re.finditer(
-            r'^\*\*\*\s+Move\s+File:\s*(.+?)\s*->\s*(.+)$',
-            body,
-            re.MULTILINE,
-        ):
-            src = _m.group(1).strip()
-            dst = _m.group(2).strip()
-            if src:
-                paths.append(src)
-            if dst:
-                paths.append(dst)
-        return paths
+        return _extract_v4a_patch_paths(args.get("patch"))
     return []
 
 
@@ -640,6 +717,8 @@ __all__ = [
     "_plan_tool_batch_segments",
     "_should_parallelize_tool_batch",
     "_canonical_path",
+    "_extract_v4a_patch_paths",
+    "_extract_parallel_scope_paths",
     "_extract_parallel_scope_path",
     "_paths_overlap",
     "_is_multimodal_tool_result",
