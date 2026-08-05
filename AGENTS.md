@@ -349,22 +349,35 @@ class AIAgent:
 
 ### Agent Loop
 
-The core loop is inside `run_conversation()` — entirely synchronous, with
-interrupt checks, budget tracking, and a one-turn grace call:
+The core loop is `run_conversation()` in `agent/conversation_loop.py` (the
+`while` is at line 1261) — entirely synchronous, with interrupt checks, budget
+tracking, and a one-turn grace call:
 
 ```python
-while (api_call_count < self.max_iterations and self.iteration_budget.remaining > 0) \
-        or self._budget_grace_call:
-    if self._interrupt_requested: break
-    response = client.chat.completions.create(model=model, messages=messages, tools=tool_schemas)
+while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) \
+        or agent._budget_grace_call or agent._cost_grace_call:
+    if agent._interrupt_requested: break
+    response = run_llm_execution_middleware(api_kwargs, _perform_api_call, ...)  # model call
     if response.tool_calls:
-        for tool_call in response.tool_calls:
-            result = handle_function_call(tool_call.name, tool_call.args, task_id)
-            messages.append(tool_result_message(result))
-        api_call_count += 1
+        agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
     else:
         return response.content
 ```
+
+`agent._execute_tool_calls` (run_agent.py:6855) routes each tool-call batch:
+
+- 1 call → `_execute_tool_calls_sequential` (run_agent.py:6982)
+- homogeneous parallel-safe batch → `_execute_tool_calls_concurrent`
+  (agent/tool_executor.py) — read-only tools and path-scoped tools
+  (`read_file`/`write_file`/`patch`) with non-overlapping targets
+- mixed batch → segment planner `_plan_tool_batch_segments`
+  (agent/tool_dispatch_helpers.py) + `execute_tool_calls_segmented`: parallel
+  runs for the safe subsets, sequential barriers for interactive/unknown tools
+
+The `finish` tool ends the turn explicitly; further tool calls in the same
+batch are discarded. `budget.cost_limit_usd` caps estimated spend in USD
+(0 = off). The todo list persists to disk at
+`~/.hermes/state/todos/<session_id>.json`.
 
 Messages follow OpenAI format: `{"role": "system/user/assistant/tool", ...}`.
 Reasoning content is stored in `assistant_msg["reasoning"]`.
