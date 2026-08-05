@@ -99,7 +99,7 @@ def finalize_turn(
         budget_exhausted
         and not interrupted
         and not failed
-        and str(_turn_exit_reason) in {"unknown", "budget_exhausted"}
+        and str(_turn_exit_reason) in {"unknown", "budget_exhausted", "cost_budget_exhausted"}
     )
     continuation_budget_exhausted = (
         final_response is None

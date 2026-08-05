@@ -223,6 +223,13 @@ DEFAULT_CONFIG = {
         # matches a key in this dict.
         # Edit directly in config.yaml (no CLI support due to dots in keys).
         "reasoning_overrides": {},
+
+        # P3b: hard cap em USD do gasto estimado por família de agentes
+        # (pai + subagentes compartilham o mesmo CostBudget). 0 = desligado.
+        # Modelos sem preço conhecido (amount_usd None) não contam para o gate.
+        "budget": {
+            "cost_limit_usd": 0.0,
+        },
     },
 
     "terminal": {
