@@ -1258,7 +1258,7 @@ def run_conversation(
             should_review_memory=_should_review_memory,
         )
 
-    while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
+    while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call or getattr(agent, "_cost_grace_call", False):
         _redirect_text = agent._drain_pending_redirect()
         if _redirect_text:
             _apply_active_turn_redirect(agent, messages, _redirect_text)
@@ -1293,6 +1293,20 @@ def run_conversation(
             _turn_exit_reason = "budget_exhausted"
             if not agent.quiet_mode:
                 agent._safe_print(f"\n⚠️  Iteration budget exhausted ({agent.iteration_budget.used}/{agent.iteration_budget.max_total} iterations used)")
+            break
+
+        # P3b — cost gate, mesma semântica de grace call do iteration budget.
+        # Ordem: iteração primeiro, custo depois (o custo é o limitante mais
+        # fino; o corte de custo não rouba a última iteração de graça do modelo).
+        if getattr(agent, "_cost_grace_call", False):
+            agent._cost_grace_call = False
+        elif getattr(agent, "cost_budget", None) is not None and agent.cost_budget.exhausted:
+            _turn_exit_reason = "cost_budget_exhausted"
+            if not agent.quiet_mode:
+                agent._safe_print(
+                    f"\n⚠️  Cost budget exhausted "
+                    f"(US$ {agent.cost_budget.used_usd:.2f} / US$ {agent.cost_budget.limit_usd:.2f} estimated spend)"
+                )
             break
 
         # Fire step_callback for gateway hooks (agent:step event)
@@ -3209,6 +3223,33 @@ def run_conversation(
                             pass
                     agent.session_cost_status = cost_result.status
                     agent.session_cost_source = cost_result.source
+
+                    # P3b — cost gate: registrar o custo desta chamada (agregador + advisors MoA).
+                    # Sem preço conhecido (amount_usd None) -> gate inerte, só debug.
+                    _cost_budget = getattr(agent, "cost_budget", None)
+                    if _cost_budget is not None and _cost_budget.enabled:
+                        if cost_result.amount_usd is not None:
+                            _turn_cost = float(cost_result.amount_usd)
+                            if _moa_ref_cost is not None:
+                                try:
+                                    _turn_cost += float(_moa_ref_cost)
+                                except (TypeError, ValueError):  # pragma: no cover - defensivo
+                                    pass
+                            if not _cost_budget.record_cost(_turn_cost) and not getattr(agent, "_cost_grace_call", False):
+                                # Estourou: dá UMA iteração de graça para o modelo
+                                # concluir (responder ou chamar tool); o topo do
+                                # loop corta na iteração seguinte.
+                                agent._cost_grace_call = True
+                                if not agent.quiet_mode:
+                                    agent._safe_print(
+                                        f"\n⚠️  Cost budget limit reached "
+                                        f"(US$ {_cost_budget.used_usd:.2f} / US$ {_cost_budget.limit_usd:.2f}) — one final call allowed"
+                                    )
+                        else:
+                            logger.debug(
+                                "Cost gate: no price for model=%s provider=%s — skipping (limit US$ %.2f)",
+                                _agg_cost_model, _agg_cost_provider, _cost_budget.limit_usd,
+                            )
 
                     # Persist token counts to session DB for /insights.
                     # Do this for every platform with a session_id so non-CLI
@@ -6109,6 +6150,26 @@ def run_conversation(
                     # was flushed (callback(None)) before tool execution,
                     # but the callback is still alive — fire the text
                     # through it so SSE/TUI clients see the explanation.
+                    if final_response:
+                        agent._safe_print(f"\n{final_response}\n")
+                        if agent.stream_delta_callback:
+                            try:
+                                agent.stream_delta_callback(final_response)
+                                agent.stream_delta_callback(None)
+                            except Exception:
+                                pass
+                    break
+
+                # P2 — finish tool: o modelo encerrou o turno explicitamente.
+                # Precedência: guardrail > finish (segurança > conveniência).
+                # O executor setou _finish_tool_summary APENAS se a chamada
+                # finish EXECUTOU de verdade (não foi bloqueada por approval/
+                # guardrail — o detector parseia o resultado, não os args).
+                _finish_summary = getattr(agent, "_finish_tool_summary", None)
+                if _finish_summary is not None:
+                    _turn_exit_reason = "finish_tool"
+                    final_response = _finish_summary or turn_content or "Task finished."
+                    messages.append({"role": "assistant", "content": final_response})
                     if final_response:
                         agent._safe_print(f"\n{final_response}\n")
                         if agent.stream_delta_callback:

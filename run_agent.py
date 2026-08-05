@@ -3447,7 +3447,14 @@ class AIAgent:
             return (
                 prefix
                 + "the per-turn iteration/cost budget was exhausted before a "
-                "final answer. Send `continue` to keep going."
+                + "final answer. Send `continue` to keep going."
+            )
+        if reason == "cost_budget_exhausted":
+            return (
+                prefix
+                + "the estimated cost budget (agent.budget.cost_limit_usd) was "
+                + "exhausted before a final answer. Send `continue` to keep "
+                + "going, or raise agent.budget.cost_limit_usd in config.yaml."
             )
         if reason == "ollama_runtime_context_too_small":
             return (
@@ -4001,6 +4008,16 @@ class AIAgent:
                 session_id = getattr(self, "session_id", None)
                 if session_db and session_id:
                     session_db.end_session(session_id, "agent_close")
+                # P3a: an owned session's persisted todo state dies with it
+                # (spec-falhas F6) -- purge the file so stale todos can't
+                # resurface on a reused id. Best-effort; purge() never raises.
+                if session_id:
+                    try:
+                        from tools.todo_tool import TodoStore
+
+                        TodoStore.purge(session_id)
+                    except Exception:
+                        pass
         except Exception:
             pass
 
