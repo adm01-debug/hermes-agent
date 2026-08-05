@@ -466,6 +466,10 @@ def build_turn_context(
     agent._unicode_sanitization_passes = 0
     agent._tool_guardrails.reset_for_turn()
     agent._tool_guardrail_halt_decision = None
+    # Finish-tool state: reset per turn so a `finish` in turn N never leaks
+    # into turn N+1 (the executor sets it via setattr when the canonical
+    # payload is observed; None = no finish this turn).
+    agent._finish_tool_summary = None
     _reset_consol = getattr(agent._memory_store, "reset_consolidation_failures", None)
     if callable(_reset_consol):
         _reset_consol()

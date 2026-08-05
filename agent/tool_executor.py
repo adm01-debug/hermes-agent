@@ -160,6 +160,78 @@ def _flush_session_db_after_tool_progress(
         return False
 
 
+# ---------------------------------------------------------------------------
+# Truncate-at-finish support (P2): when a batch contains a `finish` tool
+# call, execute only up to the first occurrence (inclusive); every trailing
+# call receives a synthetic skipped result so the 1:1 tool_call/tool_result
+# pairing strict providers (DeepSeek, Anthropic) require is preserved.
+# ---------------------------------------------------------------------------
+FINISH_TOOL_NAME = "finish"
+FINISH_SKIP_CONTENT = "Skipped: turn finished by finish tool"
+# Cap on the summary captured from the finish payload (mirrors the truncation
+# in tools/finish_tool.py) so an oversized summary can't bloat turn state.
+_FINISH_SUMMARY_MAX_CHARS = 4000
+
+
+def _find_finish_index(tool_calls) -> Optional[int]:
+    """Index of the first ``finish`` call in the batch, or None.
+
+    Accepts tool-call objects (``.function.name``) or plain name strings —
+    the concurrent path passes resolved names (post tool_search unwrap).
+    """
+    for i, tc in enumerate(tool_calls):
+        name = (
+            tc if isinstance(tc, str)
+            else getattr(getattr(tc, "function", None), "name", "")
+        )
+        if name == FINISH_TOOL_NAME:
+            return i
+    return None
+
+
+def _mark_finish_tool_summary(agent, function_result) -> None:
+    """Set ``agent._finish_tool_summary`` ONLY if the executed result is the
+    canonical finish payload (``{"finish": true, ...}``).
+
+    Parsing the real executed result — never the requested args — guards
+    against guardrail/approval-blocked calls: a blocked finish produces a
+    synthetic result without ``finish: true`` and the turn continues
+    normally. setattr-based so the attribute is created on any agent object,
+    including ones that predate the run_agent.py init change; turn_context
+    resets it to None at the start of every turn.
+    """
+    try:
+        payload = json.loads(function_result)
+        if isinstance(payload, dict) and payload.get("finish") is True:
+            summary = payload.get("summary") or ""
+            if len(summary) > _FINISH_SUMMARY_MAX_CHARS:
+                summary = summary[:_FINISH_SUMMARY_MAX_CHARS]
+            setattr(agent, "_finish_tool_summary", summary)
+    except Exception:
+        pass
+
+
+def _append_skipped_finish_results(agent, messages, tool_calls, effective_task_id) -> bool:
+    """Append one synthetic tool result per skipped call, 1:1 with ids,
+    flushing incrementally (espelha o padrão de interrupt em
+    execute_tool_calls_sequential). Returns False on flush failure."""
+    for tc in tool_calls:
+        skipped_name = getattr(getattr(tc, "function", None), "name", FINISH_TOOL_NAME)
+        messages.append(make_tool_result_message(
+            skipped_name,
+            FINISH_SKIP_CONTENT,
+            tc.id,
+            effect_disposition="none",
+        ))
+        if not _flush_session_db_after_tool_progress(
+            agent,
+            messages,
+            stage=f"skipped tool result {skipped_name}",
+        ):
+            return False
+    return True
+
+
 def _ra():
     """Lazy reference to ``run_agent`` so patches like ``run_agent._set_interrupt`` work."""
     import run_agent
@@ -729,6 +801,11 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             (tool_call, function_name, function_args, [], None, _ts_scope_block)
         )
 
+    # Truncate-at-finish: index of the first `finish` call over the RESOLVED
+    # names (post tool_search unwrap). Calls after it are never submitted to
+    # the pool and receive synthetic skipped results instead.
+    _finish_idx = _find_finish_index([pc[1] for pc in parsed_calls])
+
     # ── Logging / callbacks ──────────────────────────────────────────
     tool_names_str = ", ".join(name for _, name, _, _, _, _ in parsed_calls)
     if not agent.quiet_mode and getattr(agent, "tool_progress_mode", "all") != "off":
@@ -916,7 +993,25 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 parsed_calls
             )
             if parse_error is None
+            and (_finish_idx is None or i <= _finish_idx)
         ]
+        # Truncate-at-finish: calls after the first `finish` are never
+        # submitted (no side effects); pre-fill their result slots with
+        # synthetic skips so the post-execution loop below appends exactly
+        # one result per tool_call_id, in emission order (blocked=True →
+        # effect_disposition="none", guardrail observation skipped).
+        if _finish_idx is not None:
+            for i in range(_finish_idx + 1, len(parsed_calls)):
+                if results[i] is None:
+                    results[i] = (
+                        parsed_calls[i][1],
+                        parsed_calls[i][2],
+                        FINISH_SKIP_CONTENT,
+                        0.0,
+                        False,
+                        True,
+                        parsed_calls[i][3],
+                    )
         futures = []
         future_to_index = {}
         timed_out_indices: set[int] = set()
@@ -1167,6 +1262,14 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             if blocked:
                 effect_disposition = "none"
 
+            # Truncate-at-finish: capture the summary from the executed
+            # `finish` payload (before guardrail annotations are appended).
+            # The synthetic skip results for calls after `finish` were
+            # pre-filled above; this loop appends everything in emission
+            # order, keeping the 1:1 tool_call/tool_result pairing intact.
+            if _finish_idx is not None and i == _finish_idx and not blocked:
+                _mark_finish_tool_summary(agent, function_result)
+
             if not blocked:
                 function_result = agent._append_guardrail_observation(
                     function_name,
@@ -1324,7 +1427,13 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
     """
     # Resolve the context-scaled tool-output budget once per turn.
     _tool_budget = _budget_for_agent(agent)
-    for i, tool_call in enumerate(assistant_message.tool_calls, 1):
+    # Truncate-at-finish: execute only up to (and including) the first
+    # `finish` call; trailing calls get synthetic skipped results after the
+    # loop (1:1 tool_call/tool_result pairing preserved).
+    _finish_idx = _find_finish_index(assistant_message.tool_calls)
+    _calls = (assistant_message.tool_calls[:_finish_idx + 1]
+              if _finish_idx is not None else assistant_message.tool_calls)
+    for i, tool_call in enumerate(_calls, 1):
         if getattr(agent, "_incremental_persistence_failed", False):
             return
         # SAFETY: check interrupt BEFORE starting each tool.
@@ -1801,6 +1910,14 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 logger.error("handle_function_call raised for %s: %s", function_name, tool_error, exc_info=True)
             tool_duration = time.time() - tool_start_time
 
+        # Truncate-at-finish: capture the summary the moment the `finish`
+        # tool's canonical payload is observed (parsed from the EXECUTED
+        # result, before guardrail annotations are appended — a blocked
+        # finish yields a synthetic result without `finish: true` and the
+        # turn continues normally).
+        if function_name == FINISH_TOOL_NAME:
+            _mark_finish_tool_summary(agent, function_result)
+
         if isinstance(function_result, str):
             result_preview = function_result if agent.verbose_logging else (
                 function_result[:200] if len(function_result) > 200 else function_result
@@ -1983,6 +2100,17 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         if agent.tool_delay > 0 and i < len(assistant_message.tool_calls):
             time.sleep(agent.tool_delay)
 
+    # ── Truncate-at-finish: skipped trailing calls ───────────────────
+    # Calls emitted after the first `finish` were never executed; append one
+    # synthetic result per call so every tool_call_id still has a matching
+    # tool result before the batch goes back to the model.
+    if _finish_idx is not None:
+        tail = assistant_message.tool_calls[_finish_idx + 1:]
+        if tail and not _append_skipped_finish_results(
+            agent, messages, tail, effective_task_id
+        ):
+            return
+
     # ── Per-turn aggregate budget enforcement ─────────────────────────
     num_tools_seq = len(assistant_message.tool_calls)
     if finalize and num_tools_seq > 0:
@@ -2027,7 +2155,7 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
         _exec_cwd = Path(_active_env.cwd) if _active_env is not None and _active_env.cwd else None
         segments = _plan_tool_batch_segments(assistant_message.tool_calls, execution_cwd=_exec_cwd)
 
-    for kind, calls in segments:
+    for seg_index, (kind, calls) in enumerate(segments):
         if getattr(agent, "_incremental_persistence_failed", False):
             return
         segment_message = SimpleNamespace(tool_calls=list(calls))
@@ -2043,6 +2171,25 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
             )
 
         if getattr(agent, "_incremental_persistence_failed", False):
+            return
+
+        # Truncate-at-finish: a `finish` executed inside this segment ended
+        # the batch (its own segment executor already skipped any trailing
+        # calls within the segment). Append one synthetic skipped result per
+        # call in the REMAINING segments (1:1 pairing, emission order) and
+        # skip the whole-turn finalize — the turn is ending, so budget
+        # enforcement and /steer injection would only act on a truncated
+        # message window.
+        if getattr(agent, "_finish_tool_summary", None) is not None:
+            remaining = [
+                tc
+                for _, seg_calls in segments[seg_index + 1:]
+                for tc in seg_calls
+            ]
+            if remaining and not _append_skipped_finish_results(
+                agent, messages, remaining, effective_task_id
+            ):
+                return
             return
 
     # ── Whole-turn finalize (budget + /steer) ─────────────────────────

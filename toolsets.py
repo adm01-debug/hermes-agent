@@ -78,6 +78,13 @@ _HERMES_CORE_TOOLS = [
     "kanban_attach", "kanban_attach_url", "kanban_attachments",
     # Computer use (macOS, gated on cua-driver being installed via check_fn)
     "computer_use",
+    # Turn completion — ends the current turn; any tool calls emitted after
+    # `finish` in the same batch are skipped by the executor (truncate-at-
+    # finish, agent/tool_executor.py). MUST stay in _HERMES_CORE_TOOLS:
+    # tool_search derives core-ness from this list (tools/tool_search.py),
+    # so removing it here would make `finish` deferrable and it could vanish
+    # from the eager schema on tool-search-enabled sessions.
+    "finish",
 ]
 
 # Webhook events may originate from untrusted third-party content (for example,
