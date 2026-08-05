@@ -861,6 +861,24 @@ def init_agent(
     agent._budget_exhausted_injected = False
     agent._budget_grace_call = False
 
+    # P3b — cost gate: limite de custo estimado em USD (0 = desabilitado).
+    # Flag de grace call espelha a semântica do iteration budget; o gate é
+    # consultado no topo do loop em conversation_loop.py e o custo é
+    # registrado no bloco de contabilização de usage.
+    agent._cost_grace_call = False
+    try:
+        from hermes_cli.config import load_config as _load_cfg_cost
+        _cost_limit_usd = float(
+            (_load_cfg_cost().get("agent", {}) or {})
+            .get("budget", {})
+            .get("cost_limit_usd", 0.0)
+            or 0.0
+        )
+    except Exception:
+        _cost_limit_usd = 0.0
+    from agent.iteration_budget import CostBudget
+    agent.cost_budget = CostBudget(cost_limit_usd=_cost_limit_usd)
+
     # Activity tracking — updated on each API call, tool execution, and
     # stream chunk.  Used by the gateway timeout handler to report what the
     # agent was doing when it was killed, and by the "still working"
@@ -1545,9 +1563,21 @@ def init_agent(
         "max_tokens": max_tokens,
     }
     
-    # In-memory todo list for task planning (one per agent/session)
+    # In-memory todo list for task planning (one per agent/session).
+    # P3a: bind to the session id and hydrate from disk unless this is a
+    # helper agent that must not persist (background review forks, manual
+    # compression, hygiene) -- those get session_id=None and zero disk I/O,
+    # so they can't pollute the real session's persisted todos.
     from tools.todo_tool import TodoStore
-    agent._todo_store = TodoStore()
+
+    _persist_todos = bool(
+        agent.session_id
+        and not agent._persist_disabled
+        and agent._end_session_on_close
+    )
+    agent._todo_store = TodoStore(
+        session_id=agent.session_id if _persist_todos else None
+    )
     
     # Load config once for memory, skills, and compression sections
     try:

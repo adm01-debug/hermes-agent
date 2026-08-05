@@ -15,7 +15,14 @@ Design:
 """
 
 import json
+import logging
+import re
+from datetime import datetime
+from pathlib import Path
 from typing import Dict, Any, List, Optional
+
+
+logger = logging.getLogger(__name__)
 
 
 # Valid status values for todo items
@@ -42,6 +49,48 @@ TODO_INJECTION_HEADER = (
     "[Your active task list was preserved across context compression]"
 )
 
+# --- P3a: per-session disk persistence -------------------------------------
+# One JSON file per session: <HERMES_HOME>/state/todos/<session_id>.json,
+# written atomically (tmp + fsync + rename) via utils.atomic_json_write.
+# A failed write never breaks the tool -- the in-memory list stays the
+# source of truth for the current turn.
+TODO_STATE_SUBDIR = ("state", "todos")          # relative to get_hermes_home()
+TODO_STATE_VERSION = 1
+# Sanity cap for a state file: legit content is bounded by MAX_TODO_ITEMS *
+# MAX_TODO_CONTENT_CHARS (~1 MB worst case), so anything far beyond that is
+# forged/corrupt and rejected before parsing.
+_TODO_MAX_STATE_FILE_BYTES = 2 * 1024 * 1024
+# session_id -> filename whitelist. Blocks path traversal ("../", absolute
+# paths, backslashes, null bytes) for ids supplied by external callers
+# (spec-falhas F7). A trailing ".json" is always appended, so even "." or
+# ".." would resolve to a plain filename inside the todos dir.
+_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+
+
+def _safe_state_path(
+    session_id: Optional[str], base_dir: Optional[Path]
+) -> Optional[Path]:
+    """Resolve the state file for *session_id*, or None when persistence is off.
+
+    Persistence is disabled when session_id is empty/None or fails the
+    filename whitelist. ``base_dir`` defaults to ``get_hermes_home() / state /
+    todos`` -- resolved at call time, never cached at import time (tests
+    isolate HERMES_HOME per test; see tests/conftest.py).
+    """
+    if not session_id:
+        return None
+    if not _SESSION_ID_RE.fullmatch(session_id):
+        logger.warning(
+            "TodoStore: session_id %r rejected for persistence (invalid characters)",
+            session_id,
+        )
+        return None
+    if base_dir is None:
+        from hermes_constants import get_hermes_home
+
+        base_dir = get_hermes_home().joinpath(*TODO_STATE_SUBDIR)
+    return base_dir / f"{session_id}.json"
+
 
 class TodoStore:
     """
@@ -53,8 +102,18 @@ class TodoStore:
       - status: pending | in_progress | completed | cancelled
     """
 
-    def __init__(self):
+    def __init__(
+        self,
+        session_id: Optional[str] = None,
+        base_dir: Optional[Path] = None,
+    ) -> None:
         self._items: List[Dict[str, str]] = []
+        self._session_id = session_id
+        self._base_dir = Path(base_dir) if base_dir is not None else None
+        # P3a: hydrate from disk when a session id is set (spec 3.2). Any
+        # failure is logged inside load(); the store simply stays empty.
+        if self._state_path() is not None:
+            self.load()
 
     def write(self, todos: List[Dict[str, Any]], merge: bool = False) -> List[Dict[str, str]]:
         """
@@ -103,6 +162,9 @@ class TodoStore:
         # (list order is priority).
         if len(self._items) > MAX_TODO_ITEMS:
             self._items = self._items[:MAX_TODO_ITEMS]
+        # P3a: persist every successful mutation (replace and merge modes).
+        # Failures are logged inside save() and never break the tool.
+        self.save()
         return self.read()
 
     def read(self) -> List[Dict[str, str]]:
@@ -199,6 +261,133 @@ class TodoStore:
             item_id = str(item.get("id", "")).strip() or "?"
             last_index[item_id] = i
         return [todos[i] for i in sorted(last_index.values())]
+
+    def _state_path(self) -> Optional[Path]:
+        """State file path for this instance, or None when persistence is off."""
+        return _safe_state_path(self._session_id, self._base_dir)
+
+    def save(self) -> bool:
+        """Persist a full snapshot of _items to <base>/state/todos/<session_id>.json.
+
+        Atomic write via utils.atomic_json_write (tmp + fsync + rename).
+        Returns True on success; False on any failure (logged, never raised).
+        No-op (returns True) when persistence is disabled (no valid session_id).
+        """
+        path = self._state_path()
+        if path is None:
+            return True
+        try:
+            from utils import atomic_json_write
+
+            atomic_json_write(
+                path,
+                {
+                    "version": TODO_STATE_VERSION,
+                    "session_id": self._session_id,
+                    "updated_at": datetime.now().isoformat(),
+                    "items": self._items,
+                },
+                indent=2,
+            )
+            return True
+        except Exception as exc:
+            logger.warning(
+                "TodoStore.save failed for session=%s: %s",
+                self._session_id or "none",
+                exc,
+            )
+            return False
+
+    def load(self) -> bool:
+        """Hydrate _items from the session's state file, if present.
+
+        - Missing file -> True (silent no-op).
+        - Invalid JSON / wrong schema / OSError -> warning + empty store + False.
+        - Valid content: every item passes through _validate/_cap_content and
+          the list is truncated to MAX_TODO_ITEMS (same validation path as
+          write(), so a forged/tampered file is sanitized identically).
+        Returns True when hydrated or when there was nothing to load.
+        """
+        path = self._state_path()
+        if path is None:
+            return True  # persistence disabled for this instance
+        try:
+            if not path.exists():
+                return True
+            if path.stat().st_size > _TODO_MAX_STATE_FILE_BYTES:
+                logger.warning(
+                    "TodoStore.load: state file too large for session=%s (%d bytes), ignoring",
+                    self._session_id or "none",
+                    path.stat().st_size,
+                )
+                return False
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.warning(
+                "TodoStore.load: cannot read state file %s: %s", path, exc
+            )
+            # Preserve the corrupt file for debugging without breaking anything.
+            try:
+                backup = path.with_name(
+                    f"{path.name}.corrupt-{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                )
+                path.rename(backup)
+            except Exception:
+                pass
+            self._items = []
+            return False
+
+        try:
+            if not isinstance(raw, dict) or raw.get("version") != TODO_STATE_VERSION:
+                logger.warning(
+                    "TodoStore.load: unsupported schema for session=%s (version=%r), ignoring",
+                    self._session_id or "none",
+                    raw.get("version") if isinstance(raw, dict) else None,
+                )
+                self._items = []
+                return False
+            items = raw.get("items")
+            if not isinstance(items, list):
+                logger.warning(
+                    "TodoStore.load: 'items' missing or not a list for session=%s, ignoring",
+                    self._session_id or "none",
+                )
+                self._items = []
+                return False
+            # Same validation path as write(): _validate (+ _cap_content) +
+            # _dedupe_by_id + MAX_TODO_ITEMS truncation.
+            self._items = [self._validate(t) for t in self._dedupe_by_id(items)]
+            if len(self._items) > MAX_TODO_ITEMS:
+                self._items = self._items[:MAX_TODO_ITEMS]
+            return True
+        except Exception as exc:
+            logger.warning(
+                "TodoStore.load: validation failed for session=%s: %s",
+                self._session_id or "none",
+                exc,
+            )
+            self._items = []
+            return False
+
+    @staticmethod
+    def purge(session_id: str, base_dir: Optional[Path] = None) -> bool:
+        """Delete the session's state file (best-effort, never raises).
+
+        No-op when the session id is invalid or no file exists.
+        Returns True only if a file was actually removed.
+        """
+        path = _safe_state_path(session_id, base_dir)
+        if path is None:
+            return False
+        try:
+            if path.exists():
+                path.unlink()
+                return True
+        except OSError as exc:
+            logger.warning(
+                "TodoStore.purge failed for session=%s: %s", session_id, exc
+            )
+        return False
 
 
 def todo_tool(

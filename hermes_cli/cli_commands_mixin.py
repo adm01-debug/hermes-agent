@@ -1013,7 +1013,9 @@ class CLICommandsMixin:
             if hasattr(self.agent, "_todo_store"):
                 try:
                     from tools.todo_tool import TodoStore
-                    self.agent._todo_store = TodoStore()
+                    # P3a: bind to the resumed session -- the constructor
+                    # loads persisted todos from disk.
+                    self.agent._todo_store = TodoStore(session_id=target_id)
                 except Exception:
                     pass
             if hasattr(self.agent, "_invalidate_system_prompt"):
@@ -1209,7 +1211,10 @@ class CLICommandsMixin:
             if hasattr(self.agent, "_todo_store"):
                 try:
                     from tools.todo_tool import TodoStore
-                    self.agent._todo_store = TodoStore()
+                    # P3a: bind to the new branch id -- fresh file, so the
+                    # fork starts with an empty list (current in-memory
+                    # behavior); future writes persist under the new id.
+                    self.agent._todo_store = TodoStore(session_id=new_session_id)
                 except Exception:
                     pass
             if hasattr(self.agent, "_invalidate_system_prompt"):

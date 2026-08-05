@@ -7974,7 +7974,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             if hasattr(self.agent, "_todo_store"):
                 try:
                     from tools.todo_tool import TodoStore
-                    self.agent._todo_store = TodoStore()
+                    # P3a: /new rotates to a fresh session id -- purge the
+                    # previous session's persisted todos so they can't
+                    # resurface, then bind the store to the new id (fresh
+                    # file => empty state; future writes persist).
+                    TodoStore.purge(old_session_id)
+                    self.agent._todo_store = TodoStore(session_id=self.session_id)
                 except Exception:
                     pass
             if hasattr(self.agent, "_invalidate_system_prompt"):
