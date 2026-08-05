@@ -15,6 +15,7 @@ the late-binding seam in :mod:`hermes_cli.web_deps` so tests that
 import asyncio  # noqa: F401 — used by handlers
 import logging
 import time  # noqa: F401
+from pathlib import Path
 from typing import Any, Dict, List, Optional  # noqa: F401
 
 from fastapi import APIRouter, HTTPException, Query, Request  # noqa: F401
@@ -45,6 +46,28 @@ _prune_sessions = late("_prune_sessions")
 _read_session_import_body = late("_read_session_import_body")
 _session_latest_descendant = late("_session_latest_descendant")
 _strip_session_list_rows = late("_strip_session_list_rows")
+
+
+def _profile_sessions_dir(profile: Optional[str]) -> Optional[Path]:
+    """Resolve the on-disk transcripts dir for a profile, or ``None``.
+
+    Mirrors the home resolution used by ``_open_session_db_for_profile``:
+    a named profile resolves through ``_cron_profile_home`` (same
+    canonical-name validation and HTTP errors), while ``None``/empty falls
+    back to this process's own ``get_hermes_home()``. Returns
+    ``<home>/sessions`` so the delete endpoints can pass it through as
+    ``sessions_dir`` and get transcript / ``request_dump_*`` cleanup in
+    the same pass as the DB rows.
+    """
+    if profile:
+        _name, home = _cron_profile_home(profile)
+    else:
+        # Late import, same seam as _open_session_db_for_profile's imports
+        # (cycle-safe; resolved at call time).
+        from hermes_constants import get_hermes_home
+
+        home = get_hermes_home()
+    return Path(home) / "sessions"
 
 
 @list_router.get("/api/sessions")
@@ -411,9 +434,11 @@ async def bulk_delete_sessions_endpoint(body: BulkDeleteSessions):
     * Active and archived sessions ARE deleted when explicitly
       selected — unlike ``DELETE /api/sessions/empty``, the user
       hand-picked the rows so we trust the selection.
-    * Like the other session-delete endpoints, this does NOT pass a
-      ``sessions_dir`` through; on-disk transcript / request-dump
-      cleanup runs at the CLI/agent layer on the next prune pass.
+    * Like the other session-delete endpoints, this passes a
+      ``sessions_dir`` through (resolved from ``body.profile`` the same
+      way ``_open_session_db_for_profile`` resolves its home), so on-disk
+      transcript / request-dump cleanup happens in the same pass as the
+      DB rows instead of waiting for the next prune pass.
 
     The response carries the actual deleted count, so the dashboard
     can surface it in a toast. The IDs that were removed are not
@@ -434,7 +459,7 @@ async def bulk_delete_sessions_endpoint(body: BulkDeleteSessions):
     def _delete() -> int:
         db = _open_session_db_for_profile(body.profile, read_only=False)
         try:
-            return db.delete_sessions(body.ids)
+            return db.delete_sessions(body.ids, sessions_dir=_profile_sessions_dir(body.profile))
         finally:
             db.close()
 
@@ -500,16 +525,16 @@ async def delete_empty_sessions_endpoint(profile: Optional[str] = None):
     * Children of deleted parents are orphaned, not cascade-deleted.
 
     Like the single-session ``DELETE /api/sessions/{id}`` endpoint
-    below, this doesn't pass a ``sessions_dir`` through — the on-disk
-    transcript / request-dump cleanup is wired at the CLI/agent layer
-    but the web server historically leaves file cleanup to the next
-    prune-on-startup pass. Matching that pre-existing trade-off keeps
-    the two delete endpoints' DB-vs-disk behaviour consistent.
+    below, this passes a ``sessions_dir`` through (resolved from
+    ``profile`` the same way ``_open_session_db_for_profile`` resolves
+    its home), so any on-disk transcript / request-dump files for the
+    removed sessions are cleaned up in the same pass as the DB rows —
+    matching the DB-vs-disk behaviour of the CLI prune paths.
     """
     def _delete() -> int:
         db = _open_session_db_for_profile(profile, read_only=False)
         try:
-            return db.delete_empty_sessions()
+            return db.delete_empty_sessions(sessions_dir=_profile_sessions_dir(profile))
         finally:
             db.close()
 
@@ -650,7 +675,7 @@ async def delete_session_endpoint(session_id: str, profile: Optional[str] = None
             sid = db.resolve_session_id(session_id)
             if not sid:
                 return {"ok": True, "already_absent": True}
-            db.delete_session(sid)
+            db.delete_session(sid, sessions_dir=_profile_sessions_dir(profile))
             return {"ok": True}
         finally:
             db.close()

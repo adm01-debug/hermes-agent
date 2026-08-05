@@ -123,10 +123,10 @@ class TestStaleCheckOutsideLock:
 
         orig = store._is_session_ended_in_db
 
-        def tracking(sid):
+        def tracking(sid, **kw):
             if lock.held:
                 calls_under_lock.append(sid)
-            return orig(sid)
+            return orig(sid, **kw)
 
         store._is_session_ended_in_db = tracking  # type: ignore[method-assign]
 

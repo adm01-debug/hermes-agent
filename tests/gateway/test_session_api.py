@@ -608,3 +608,60 @@ async def test_require_model_lock_hard_fails_when_global_default_would_be_used(a
     mock_run.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_delete_session_purges_gateway_routing_and_sessions_json(adapter, session_db):
+    """DELETE /api/sessions/{id} must purge the deleted session from the
+    gateway_routing index and the sessions.json mirror (sessions_dir fix).
+
+    The gateway rehydrates its routing from both stores — a stale entry
+    anywhere resurrects the dead session id on the next start or structural
+    save. The handler now passes ``sessions_dir`` into ``delete_session``,
+    which scrubs ``gateway_routing`` rows whose embedded ``session_id`` was
+    deleted and rewrites ``<sessions_dir>/sessions.json`` without them.
+    """
+    import json as _json
+
+    from hermes_constants import get_hermes_home
+
+    session_id = session_db.create_session(
+        "delete-routing-session", "api_server", session_key="agent:main:telegram:dm:te1"
+    )
+    session_key = "agent:main:telegram:dm:te1"
+    sessions_dir = get_hermes_home() / "sessions"
+    scope = str(sessions_dir.resolve())
+    session_db.save_gateway_routing_entry(
+        session_key, _json.dumps({"session_id": session_id}), scope=scope
+    )
+    # Mirror the legacy sessions.json shape: routing key -> serialized entry.
+    sessions_json = sessions_dir / "sessions.json"
+    sessions_json.write_text(
+        _json.dumps(
+            {
+                "_README": "sentinel",
+                session_key: _json.dumps({"session_id": session_id}),
+                "agent:main:telegram:dm:te1-other": _json.dumps(
+                    {"session_id": "live-other"}
+                ),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.delete(f"/api/sessions/{session_id}")
+        assert resp.status == 200, await resp.text()
+        body = await resp.json()
+
+    assert body["deleted"] is True
+    # gateway_routing purged for the deleted id...
+    assert session_db.load_gateway_routing_entries(scope=scope) == {}
+    # ...and the sessions.json mirror entry is gone (sentinels preserved,
+    # unrelated routing keys untouched).
+    data = _json.loads(sessions_json.read_text(encoding="utf-8"))
+    assert session_key not in data
+    assert data["_README"] == "sentinel"
+    assert "agent:main:telegram:dm:te1-other" in data
+
+
+
