@@ -832,6 +832,12 @@ class SessionEntry:
     # (see sanitize_model_override / SessionStore.set_model_override).
     model_override: Optional[Dict[str, str]] = None
 
+    # True when this entry's routing row exists in state.db (created via
+    # create_session or rebuilt from a recovered DB row).  False for entries
+    # that only live in sessions.json.  Used by delete routing to decide
+    # whether removing the session must also drop the DB row.
+    db_persisted: bool = False
+
     def to_dict(self) -> Dict[str, Any]:
         result = {
             "session_key": self.session_key,
@@ -864,6 +870,7 @@ class SessionEntry:
             "auto_reset_reason": self.auto_reset_reason,
             "reset_had_activity": self.reset_had_activity,
             "prev_session_id": self.prev_session_id,
+            "db_persisted": self.db_persisted,
         }
         if self.model_override:
             # Defence-in-depth: strip credentials even if a caller stored an
@@ -942,6 +949,7 @@ class SessionEntry:
             reset_had_activity=data.get("reset_had_activity", False),
             prev_session_id=data.get("prev_session_id"),
             model_override=sanitize_model_override(data.get("model_override")),
+            db_persisted=data.get("db_persisted", False),
         )
 
 
@@ -1341,9 +1349,12 @@ class SessionStore:
 
         Called once during startup (from ``_ensure_loaded_locked``, lock held).
         A ``session_id`` is stale when state.db reports ``end_reason IS NOT
-        NULL`` for it. Sessions absent from the DB (never persisted / pre-SQLite
-        legacy) are left alone, and a ``None`` DB handle (SQLite unavailable) is
-        a no-op. DB errors are non-fatal — startup must never fail here.
+        NULL`` for it, or when the row is missing entirely for an entry that
+        was previously persisted there (``db_persisted`` — the row was deleted
+        from state.db). Sessions absent from the DB that were never persisted
+        (pre-SQLite legacy, ``db_persisted=False``) are left alone, and a
+        ``None`` DB handle (SQLite unavailable) is a no-op. DB errors are
+        non-fatal — startup must never fail here.
         """
         db = getattr(self, "_db", None)
         if not db or not self._entries:
@@ -1354,10 +1365,26 @@ class SessionStore:
         try:
             for key, entry in self._entries.items():
                 row = db.get_session(entry.session_id)
-                # row is None        -> not in DB (legacy / pre-SQLite) — keep
+                # row is None        -> not in DB: keep only when the entry
+                #                       never reached state.db (legacy /
+                #                       pre-SQLite, db_persisted=False). A
+                #                       persisted entry whose row is gone was
+                #                       deleted from state.db — prune without
+                #                       recovery (nothing to reopen).
                 # end_reason is None  -> session alive — keep
                 # end_reason not None -> session ended — prune
-                if row is not None and row.get("end_reason") is not None:
+                if row is None:
+                    if getattr(entry, "db_persisted", False):
+                        logger.warning(
+                            "gateway.session: pruning stale sessions.json "
+                            "entry %r -> %s (row deleted from state.db)",
+                            key, entry.session_id,
+                        )
+                        stale_keys.append(key)
+                    # Legacy entry never persisted to state.db: absence is
+                    # expected, keep it.
+                    continue
+                if row.get("end_reason") is not None:
                     recovered_entry = None
                     recovery_lookup_failed = False
                     if entry.origin is not None:
@@ -1759,6 +1786,7 @@ class SessionStore:
             source=source,
             now=now,
         )
+        entry.db_persisted = True
         if migrated_legacy:
             self._record_gateway_session_peer(
                 entry.session_id,
@@ -1817,6 +1845,7 @@ class SessionStore:
         entry = self._create_entry_from_recovered_row(
             row=recovered, session_key=session_key, source=source, now=now,
         )
+        entry.db_persisted = True
         if migrated_legacy:
             self._record_gateway_session_peer(
                 entry.session_id,
@@ -1991,12 +2020,14 @@ class SessionStore:
         except Exception:
             return False
 
-    def _is_session_ended_in_db(self, session_id: str) -> bool:
+    def _is_session_ended_in_db(
+        self, session_id: str, *, treat_missing_as_ended: bool = False
+    ) -> bool:
         """Return True iff state.db has this session with a non-null end_reason.
 
         Mirrors the staleness test in ``_prune_stale_sessions_locked``:
           - no DB handle / no session_id -> False (can't tell — keep)
-          - row absent (legacy / not yet persisted) -> False (keep)
+          - row absent (legacy / not yet persisted) -> treat_missing_as_ended
           - end_reason is None -> False (alive — keep)
           - end_reason not None -> True (ended — stale)
 
@@ -2015,7 +2046,9 @@ class SessionStore:
             row = db.get_session(session_id)
         except Exception:
             return False
-        return bool(row is not None and row.get("end_reason") is not None)
+        if row is None:
+            return treat_missing_as_ended
+        return bool(row.get("end_reason") is not None)
 
     def _should_reset(self, entry: SessionEntry, source: SessionSource) -> Optional[str]:
         """
@@ -2267,9 +2300,28 @@ class SessionStore:
 
         # ---- Phase 1b: no-lock I/O -- stale check + reset policy ----
         _is_stale = False
+        _stale_because_missing = False
         _reset_reason = None
         if _entry_for_checks is not None and _stale_session_id is not None:
-            _is_stale = self._is_session_ended_in_db(_stale_session_id)
+            _is_stale = self._is_session_ended_in_db(
+                _stale_session_id,
+                treat_missing_as_ended=bool(
+                    getattr(_entry_for_checks, "db_persisted", False)
+                ),
+            )
+            # A persisted entry whose state.db row is gone entirely was
+            # deleted from state.db (routing cleanup), not merely ended:
+            # recovery has no row to reopen, so Phase 3 skips the lookup
+            # and a fresh session is created directly.
+            if _is_stale:
+                _db = getattr(self, "_db", None)
+                if _db is not None and hasattr(_db, "get_session"):
+                    try:
+                        _stale_because_missing = (
+                            _db.get_session(_stale_session_id) is None
+                        )
+                    except Exception:
+                        _stale_because_missing = False
             if _entry_for_checks.suspended:
                 _reset_reason = "suspended"
             elif _entry_for_checks.resume_pending:
@@ -2299,6 +2351,13 @@ class SessionStore:
         # ---- Phase 2: lock write -- apply decisions to _entries ----
         _needs_save = False
         _needs_recover = False
+        # Set ONLY in the stale-drop branch below: this specific entry was
+        # dropped because its state.db row is gone (deleted), so Phase 3
+        # must skip _query_recoverable_session for it. Deliberately NOT the
+        # shared _stale_because_missing variable — _needs_recover is also set
+        # in the "key absent from _entries" branch (another thread removed
+        # it), where recovery IS legitimate.
+        _skip_recovery_for_missing = False
         entry: Optional[SessionEntry] = None
         was_auto_reset = False
         auto_reset_reason = None
@@ -2321,14 +2380,27 @@ class SessionStore:
                     # Recovery finder reopens ``agent_close`` and mistaken
                     # ``ws_orphan_reap`` rows (preserving the transcript) but
                     # returns None for other end_reasons (e.g. /new), starting
-                    # a fresh session.
-                    logger.warning(
-                        "gateway.session: routing key %r -> %s is ended in "
-                        "state.db but still live in sessions.json; dropping "
-                        "stale entry and recovering/recreating the session "
-                        "(#54878)",
-                        session_key, entry.session_id,
-                    )
+                    # a fresh session. When the row is missing entirely
+                    # (_stale_because_missing — deleted from state.db),
+                    # recovery has nothing to reopen, so Phase 3 skips the
+                    # lookup and a fresh session is created directly.
+                    if _stale_because_missing:
+                        _skip_recovery_for_missing = True
+                        logger.warning(
+                            "gateway.session: routing key %r -> %s was deleted "
+                            "from state.db (row deleted from state.db) but is "
+                            "still live in sessions.json; dropping stale entry "
+                            "and creating a fresh session",
+                            session_key, entry.session_id,
+                        )
+                    else:
+                        logger.warning(
+                            "gateway.session: routing key %r -> %s is ended in "
+                            "state.db but still live in sessions.json; dropping "
+                            "stale entry and recovering/recreating the session "
+                            "(#54878)",
+                            session_key, entry.session_id,
+                        )
                     self._entries.pop(session_key, None)
                     # If an expiry watcher (daily/idle reset) already finalized
                     # this session, honour the reset decision instead of silently
@@ -2365,7 +2437,11 @@ class SessionStore:
                     _needs_recover = True
 
         # ---- Phase 3: no-lock I/O -- recovery + create + save + DB ops ----
-        if _needs_recover and db_end_session_id is None:
+        if (
+            _needs_recover
+            and db_end_session_id is None
+            and not _skip_recovery_for_missing
+        ):
             # The legacy (pre-workspace) Slack key fallback happens INSIDE
             # _query_recoverable_session (#20583/#66398 design): it performs
             # the exact-key legacy lookup, claims the key once per process,
@@ -2451,6 +2527,15 @@ class SessionStore:
         if self._db and db_create_kwargs:
             try:
                 self._db.create_session(**db_create_kwargs)
+                entry.db_persisted = True
+                # Persist the flag immediately: the routing index was already
+                # saved above with db_persisted=False (the candidate was
+                # serialized before create_session ran). If we restart before
+                # the next per-turn save, the reloaded entry would look like
+                # a legacy entry (db_persisted=False) and the delete-routing
+                # staleness detection would not fire for it. One extra
+                # structural save here makes the flag durable.
+                self._save_entries()
                 self._record_gateway_session_peer(
                     session_id,
                     session_key,

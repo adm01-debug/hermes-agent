@@ -18,6 +18,7 @@ import asyncio
 import atexit
 import contextlib
 import json
+import tempfile
 import logging
 import os
 import random
@@ -41,7 +42,7 @@ from hermes_constants import get_hermes_home
 from hermes_cli.sqlite_runtime import (
     is_sqlite_wal_reset_vulnerable as _is_sqlite_wal_reset_vulnerable,
 )
-from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, TypeVar
 
 from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     _BRANCH_CHILD_SQL,
@@ -2589,7 +2590,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     def delete_gateway_routing_entries(
         self, session_keys: List[str], *, scope: str = ""
     ) -> None:
-        """Remove routing entries for the given session keys in *scope*."""
+        """Remove routing entries for the given session keys in *scope*.
+
+        Note: this is explicit, key-by-key cleanup. Automatic cleanup when
+        sessions are deleted goes through
+        :meth:`_purge_gateway_routing_for_sessions`, which matches routing
+        entries by ``session_id``; prefer that helper in delete flows
+        instead of resolving session IDs to keys and calling this method.
+        """
         if not session_keys:
             return
 
@@ -2600,6 +2608,39 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
 
         self._execute_write(_do)
+
+    def _purge_gateway_routing_for_sessions(
+        self, conn: sqlite3.Connection, session_ids: Iterable[str]
+    ) -> List[Tuple[str, str]]:
+        """Delete routing entries whose embedded ``session_id`` was deleted.
+
+        Runs on the connection of the in-flight write transaction (the
+        ``conn`` handed to a ``_do`` callback).  Only rows whose parsed
+        ``entry_json`` carries a ``session_id`` present in *session_ids* are
+        removed — a routing key that still points at a live session is left
+        alone even if its key collides with a deleted id.  Rows with invalid
+        JSON are skipped.  Returns the removed ``(scope, session_key)`` pairs.
+        """
+        removed: List[Tuple[str, str]] = []
+        if not session_ids:
+            return removed
+        target_ids = set(session_ids)
+        rows = conn.execute(
+            "SELECT scope, session_key, entry_json FROM gateway_routing"
+        ).fetchall()
+        for row in rows:
+            try:
+                entry = json.loads(row["entry_json"])
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(entry, dict) or entry.get("session_id") not in target_ids:
+                continue
+            conn.execute(
+                "DELETE FROM gateway_routing WHERE scope = ? AND session_key = ?",
+                (row["scope"], row["session_key"]),
+            )
+            removed.append((row["scope"], row["session_key"]))
+        return removed
 
     def list_gateway_sessions(
         self,
@@ -4163,10 +4204,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             """, (cutoff,)).fetchall()
             ids = [r[0] if isinstance(r, (tuple, list)) else r["id"] for r in rows]
             if ids:
-                placeholders = ",".join("?" * len(ids))
+                placeholders = ", ".join("?" * len(ids))
                 conn.execute(
                     f"DELETE FROM sessions WHERE id IN ({placeholders})", ids
                 )
+                self._purge_gateway_routing_for_sessions(conn, ids)
             return ids
 
         removed_ids = self._execute_write(_do) or []
@@ -4174,6 +4216,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if sessions_dir and removed_ids:
             for sid in removed_ids:
                 self._remove_session_files(sessions_dir, sid)
+            self._remove_sessions_json_entries(sessions_dir, removed_ids)
         return len(removed_ids)
 
     def finalize_orphaned_compression_sessions(self) -> int:
@@ -6531,6 +6574,78 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         except OSError:
             pass
 
+    @staticmethod
+    def _remove_sessions_json_entries(
+        sessions_dir: Optional[Path], session_ids: Iterable[str]
+    ) -> int:
+        """Drop routing entries for deleted sessions from ``sessions.json``.
+
+        Removes only keys whose entry carries a ``session_id`` in
+        *session_ids*; sentinel keys (``_README``, anything starting with
+        ``_``) are preserved.  The file is rewritten atomically (temp file in
+        the same directory + ``os.replace``) only when something actually
+        changed.  Never raises: ``OSError``/``ValueError`` are logged at debug
+        level and ``0`` is returned.  Returns the number of entries removed.
+
+        Both value shapes written by the gateway are accepted: the real
+        mirror format ``{key: entry_dict}`` (``SessionStore._save_sessions_json``)
+        and the legacy ``{key: entry_json_string}`` form.
+
+        Note on concurrency: this file-level prune does not hold the
+        gateway's in-process ``_save_lock``.  A concurrent gateway rewrite of
+        the same file can repopulate a key right after the prune (lost
+        update); the gateway-side staleness detection (``db_persisted`` +
+        row-missing) is the authoritative backstop for live gateways — this
+        helper handles the gateway-stopped / restart case.
+        """
+        if sessions_dir is None or not session_ids:
+            return 0
+        target_ids = set(session_ids)
+        sessions_file = Path(sessions_dir) / "sessions.json"
+        try:
+            if not sessions_file.is_file():
+                return 0
+            with open(sessions_file, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            if not isinstance(data, dict):
+                return 0
+            removed = 0
+            for key in [k for k in data if not k.startswith("_")]:
+                raw = data[key]
+                if isinstance(raw, dict):
+                    entry = raw
+                elif isinstance(raw, str):
+                    try:
+                        entry = json.loads(raw)
+                    except (TypeError, ValueError):
+                        continue
+                else:
+                    continue
+                if isinstance(entry, dict) and entry.get("session_id") in target_ids:
+                    del data[key]
+                    removed += 1
+            if not removed:
+                return 0
+            fd, tmp_path = tempfile.mkstemp(
+                dir=str(sessions_dir), prefix=".sessions_", suffix=".tmp"
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    json.dump(data, fh, indent=2)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.replace(tmp_path, sessions_file)
+            except BaseException:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
+            return removed
+        except (OSError, ValueError) as exc:
+            logger.debug("Could not prune sessions.json entries: %s", exc)
+            return 0
+
     def get_session_delete_targets(self, session_id: str) -> List[str]:
         """Return every session row that :meth:`delete_session` would remove.
 
@@ -6597,6 +6712,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+            self._purge_gateway_routing_for_sessions(
+                conn, [session_id, *removed_delegate_ids]
+            )
             return True
 
         deleted = self._execute_write(_do)
@@ -6604,6 +6722,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             for delegate_id in removed_delegate_ids:
                 self._remove_session_files(sessions_dir, delegate_id)
             self._remove_session_files(sessions_dir, session_id)
+            self._remove_sessions_json_entries(
+                sessions_dir, [session_id, *removed_delegate_ids]
+            )
         return bool(deleted)
 
     def delete_session_if_empty(
@@ -6641,11 +6762,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 """,
                 (session_id,),
             )
+            if cursor.rowcount > 0:
+                self._purge_gateway_routing_for_sessions(conn, [session_id])
             return cursor.rowcount > 0
 
         deleted = self._execute_write(_do)
         if deleted:
             self._remove_session_files(sessions_dir, session_id)
+            self._remove_sessions_json_entries(sessions_dir, [session_id])
         return bool(deleted)
 
     def delete_sessions(
@@ -6721,6 +6845,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 f"DELETE FROM sessions WHERE id IN ({existing_placeholders})",
                 existing,
             )
+            self._purge_gateway_routing_for_sessions(
+                conn, existing + removed_delegate_ids
+            )
             removed_ids.extend(existing)
             return len(existing)
 
@@ -6729,6 +6856,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             self._remove_session_files(sessions_dir, sid)
         for sid in removed_ids:
             self._remove_session_files(sessions_dir, sid)
+        self._remove_sessions_json_entries(
+            sessions_dir, removed_ids + removed_delegate_ids
+        )
         return count
 
     def count_empty_sessions(self) -> int:
@@ -6816,11 +6946,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 )
                 conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
                 removed_ids.append(sid)
+            self._purge_gateway_routing_for_sessions(conn, removed_ids)
             return len(session_ids)
 
         count = self._execute_write(_do)
         for sid in removed_ids:
             self._remove_session_files(sessions_dir, sid)
+        self._remove_sessions_json_entries(sessions_dir, removed_ids)
         return count
 
     @staticmethod
@@ -7154,12 +7286,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 conn.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
                 conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
                 removed_ids.append(sid)
+            self._purge_gateway_routing_for_sessions(conn, removed_ids)
             return len(session_ids)
 
         count = self._execute_write(_do)
         # Clean up on-disk files outside the DB transaction
         for sid in removed_ids:
             self._remove_session_files(sessions_dir, sid)
+        self._remove_sessions_json_entries(sessions_dir, removed_ids)
         return count
 
     # ── Meta key/value (for scheduler bookkeeping) ──

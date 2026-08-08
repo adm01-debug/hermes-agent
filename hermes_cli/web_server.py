@@ -11598,9 +11598,10 @@ async def bulk_delete_sessions_endpoint(body: BulkDeleteSessions):
     * Active and archived sessions ARE deleted when explicitly
       selected — unlike ``DELETE /api/sessions/empty``, the user
       hand-picked the rows so we trust the selection.
-    * Like the other session-delete endpoints, this does NOT pass a
-      ``sessions_dir`` through; on-disk transcript / request-dump
-      cleanup runs at the CLI/agent layer on the next prune pass.
+    * Like the other session-delete endpoints, this passes a
+      ``sessions_dir`` through so on-disk transcript / request-dump
+      cleanup and the legacy sessions.json mirror prune run in the
+      same delete operation.
 
     The response carries the actual deleted count, so the dashboard
     can surface it in a toast. The IDs that were removed are not
@@ -11621,7 +11622,7 @@ async def bulk_delete_sessions_endpoint(body: BulkDeleteSessions):
     def _delete() -> int:
         db = _open_session_db_for_profile(body.profile)
         try:
-            return db.delete_sessions(body.ids)
+            return db.delete_sessions(body.ids, sessions_dir=_profile_sessions_dir(body.profile))
         finally:
             db.close()
 
@@ -11687,16 +11688,16 @@ async def delete_empty_sessions_endpoint(profile: Optional[str] = None):
     * Children of deleted parents are orphaned, not cascade-deleted.
 
     Like the single-session ``DELETE /api/sessions/{id}`` endpoint
-    below, this doesn't pass a ``sessions_dir`` through — the on-disk
-    transcript / request-dump cleanup is wired at the CLI/agent layer
-    but the web server historically leaves file cleanup to the next
-    prune-on-startup pass. Matching that pre-existing trade-off keeps
-    the two delete endpoints' DB-vs-disk behaviour consistent.
+    below, this passes a ``sessions_dir`` through so on-disk transcript /
+    request-dump cleanup and the legacy sessions.json mirror prune run in
+    the same delete operation.
     """
     def _delete() -> int:
         db = _open_session_db_for_profile(profile)
         try:
-            return db.delete_empty_sessions()
+            return db.delete_empty_sessions(
+                sessions_dir=_profile_sessions_dir(profile)
+            )
         finally:
             db.close()
 
@@ -11749,6 +11750,20 @@ def _open_session_db_for_profile(profile: Optional[str]):
         return SessionDB()
     _name, home = _cron_profile_home(profile)
     return SessionDB(db_path=Path(home) / "state.db")
+
+
+def _profile_sessions_dir(profile: Optional[str]) -> Optional[Path]:
+    """Resolve the ``sessions`` dir for *profile* (delete cleanup target).
+
+    Mirrors ``_open_session_db_for_profile``: None/empty → this process's
+    own home; a named profile resolves through ``_cron_profile_home`` so
+    cross-profile deletes clean that profile's on-disk transcripts and the
+    legacy sessions.json mirror.
+    """
+    if not profile:
+        return Path(get_hermes_home()) / "sessions"
+    _name, home = _cron_profile_home(profile)
+    return Path(home) / "sessions"
 
 
 # In-process throttle for the opportunistic auto-archive trigger, keyed by
@@ -11917,7 +11932,7 @@ async def delete_session_endpoint(session_id: str, profile: Optional[str] = None
             sid = db.resolve_session_id(session_id)
             if not sid:
                 return {"ok": True, "already_absent": True}
-            db.delete_session(sid)
+            db.delete_session(sid, sessions_dir=_profile_sessions_dir(profile))
             return {"ok": True}
         finally:
             db.close()

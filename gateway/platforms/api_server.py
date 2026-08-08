@@ -1743,6 +1743,13 @@ class APIServerAdapter(BasePlatformAdapter):
         except Exception:
             return _PROFILE_REJECTED
         if profile not in served:
+            # 'hermes' is the implicit default profile identifier — sessions
+            # created before explicit multi-profile support carry this reserved
+            # name and live in the root state.db.  Treat it as the default
+            # profile so that archive/delete/rename mutations work correctly
+            # for the sidebar's "Default" section.
+            if profile == 'hermes':
+                return None
             return _PROFILE_REJECTED
         return profile
 
@@ -3228,7 +3235,7 @@ class APIServerAdapter(BasePlatformAdapter):
         body, err = await self._read_json_body(request)
         if err:
             return err
-        allowed = {"title", "end_reason"}
+        allowed = {"title", "end_reason", "archived", "pinned"}
         unknown = sorted(set(body) - allowed)
         if unknown:
             return web.json_response(_openai_error(f"Unsupported session fields: {', '.join(unknown)}", code="unsupported_session_field"), status=400)
@@ -3241,6 +3248,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 return web.json_response(_openai_error(str(exc), code="invalid_title"), status=400)
         if body.get("end_reason"):
             await asyncio.to_thread(db.end_session, session_id, str(body["end_reason"]))
+        if "archived" in body:
+            await asyncio.to_thread(db.set_session_archived, session_id, bool(body["archived"]))
+        if "pinned" in body:
+            await asyncio.to_thread(db.set_session_pinned, session_id, bool(body["pinned"]))
         session = await asyncio.to_thread(db.get_session, session_id) or session
         return web.json_response({"object": "hermes.session", "session": self._session_response(session)})
 
@@ -3254,7 +3265,41 @@ class APIServerAdapter(BasePlatformAdapter):
         if err:
             return err
         db = await self._ensure_session_db_async()
-        deleted = await asyncio.to_thread(db.delete_session, session_id)
+        # Resolve the sessions dir from the live SessionStore when available
+        # (honors a custom gateway.sessions_dir config); falls back to the
+        # default <hermes_home>/sessions otherwise. Hardcoding get_hermes_home()
+        # here would prune the wrong sessions.json / transcripts whenever the
+        # gateway is configured with a non-default sessions_dir.
+        sessions_dir = None
+        store = getattr(self, "_session_store", None)
+        if store is not None:
+            try:
+                sessions_dir = Path(store.sessions_dir)
+            except Exception:
+                sessions_dir = None
+        if sessions_dir is None:
+            from hermes_constants import get_hermes_home
+
+            sessions_dir = Path(get_hermes_home()) / "sessions"
+        deleted = await asyncio.to_thread(db.delete_session, session_id, sessions_dir)
+        # If the row was actually deleted (not already absent), drop the
+        # in-memory entry from the live SessionStore so a running gateway
+        # does not resurrect the dead session on the next save. forget_sessions
+        # may not exist yet while gateway/session.py is being upgraded, so
+        # probe defensively and never propagate store failures to the caller.
+        if deleted:
+            store = getattr(self, "_session_store", None)
+            if store is not None:
+                try:
+                    forget = getattr(store, "forget_sessions", None)
+                    if callable(forget):
+                        await asyncio.to_thread(forget, [session_id])
+                except Exception:
+                    logger.warning(
+                        "Failed to forget session %s from SessionStore after API delete",
+                        session_id,
+                        exc_info=True,
+                    )
         return web.json_response({"object": "hermes.session.deleted", "id": session_id, "deleted": bool(deleted)})
 
     async def _handle_session_messages(self, request: "web.Request") -> "web.Response":

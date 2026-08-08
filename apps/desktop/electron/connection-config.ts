@@ -184,7 +184,13 @@ async function resolveTestWsUrl(baseUrl, authMode, token, deps: any = {}) {
 // Normalize a profile name to a connection scope key, or null for the global
 // (default) connection. Shared by the resolver and the IPC layer.
 function connectionScopeKey(profile) {
-  return String(profile ?? '').trim() || null
+  const key = String(profile ?? '').trim()
+  // 'hermes' is the implicit default profile — sessions created before explicit
+  // multi-profile support carry this reserved name and live in the root state.db.
+  // Treat it as the primary profile so mutations route to the primary backend
+  // instead of trying to spawn a pool backend for a non-existent profile.
+  if (!key || key === 'hermes') return null
+  return key
 }
 
 // Coerce a remote auth mode to one of the two supported values ('token' default).

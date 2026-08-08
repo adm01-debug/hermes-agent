@@ -367,10 +367,11 @@ class SessionManager:
         if db is not None:
             try:
                 rows = db.search_sessions(source="acp", limit=10000)
+                sessions_dir = self._sessions_dir()
                 for row in rows:
                     sid = row["id"]
                     _clear_task_cwd(sid)
-                    db.delete_session(sid)
+                    db.delete_session(sid, sessions_dir=sessions_dir)
             except Exception:
                 logger.debug("Failed to cleanup ACP sessions from DB", exc_info=True)
 
@@ -407,6 +408,14 @@ class SessionManager:
             return self._db_instance
         except Exception:
             logger.debug("SessionDB unavailable for ACP persistence", exc_info=True)
+            return None
+
+    def _sessions_dir(self):
+        """Resolve the sessions dir for on-disk delete cleanup."""
+        try:
+            return get_hermes_home() / "sessions"
+        except Exception:
+            logger.debug("Could not resolve sessions dir for ACP cleanup", exc_info=True)
             return None
 
     def _persist(self, state: SessionState) -> None:
@@ -580,7 +589,7 @@ class SessionManager:
         if db is None:
             return False
         try:
-            return db.delete_session(session_id)
+            return db.delete_session(session_id, sessions_dir=self._sessions_dir())
         except Exception:
             logger.debug("Failed to delete ACP session %s from DB", session_id, exc_info=True)
             return False

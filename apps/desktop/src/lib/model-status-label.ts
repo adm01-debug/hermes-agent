@@ -53,7 +53,21 @@ const VARIANT_TAGS: ReadonlyArray<readonly [RegExp, string]> = [
 
 const titleCase = (text: string): string => text.replace(/\b\w/g, char => char.toUpperCase()).trim()
 
+// Lobocode proxy re-uses Claude IDs for MiniMax models — map them to their
+// real names so the picker never shows the fake Claude label.
+const LOBOCODE_MODEL_NAMES: Record<string, string> = {
+  'claude-opus-4-8':  'MiniMax M2.5',
+  'claude-sonnet-5':  'MiniMax M3',
+  'claude-sonnet-4-6': 'MiniMax M1',
+  'claude-haiku-4-5': 'MiniMax Light',
+}
+
 function prettifyBase(base: string): string {
+  const lobocodeDisplay = LOBOCODE_MODEL_NAMES[base.toLowerCase()] ?? LOBOCODE_MODEL_NAMES[base]
+  if (lobocodeDisplay) {
+    return lobocodeDisplay
+  }
+
   if (/^claude-/i.test(base)) {
     return titleCase(base.replace(/^claude-/i, '').replace(/-/g, ' '))
   }
