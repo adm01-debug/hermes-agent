@@ -11,9 +11,8 @@ from hermes_state import SessionDB
 
 
 class FakeStore:
-    sessions_dir = "C:/tmp/sessions"
-
-    def __init__(self, result=1, raise_on_forget=False):
+    def __init__(self, result=1, raise_on_forget=False, sessions_dir="C:/tmp/sessions"):
+        self.sessions_dir = sessions_dir
         self.result = result
         self.raise_on_forget = raise_on_forget
         self.calls = []
@@ -50,9 +49,9 @@ def _adapter(db, store):
 
 
 @pytest.mark.asyncio
-async def test_delete_calls_forget_sessions_and_logs_result(db):
+async def test_delete_calls_forget_sessions_and_logs_result(db, tmp_path):
     db.create_session("sess-1", "api_server")
-    store = FakeStore(result=1)
+    store = FakeStore(result=1, sessions_dir=str(tmp_path / "sessions"))
     app = _make_app(_adapter(db, store))
     async with TestClient(TestServer(app)) as cli:
         with patch("gateway.platforms.api_server.logger") as mock_logger:
@@ -67,13 +66,13 @@ async def test_delete_calls_forget_sessions_and_logs_result(db):
 
 
 @pytest.mark.asyncio
-async def test_delete_store_without_forget_sessions_is_skipped(db):
+async def test_delete_store_without_forget_sessions_is_skipped(db, tmp_path):
     db.create_session("sess-2", "api_server")
 
     class NoForgetStore(FakeStore):
         forget_sessions = None  # attribute present but not callable
 
-    store = NoForgetStore()
+    store = NoForgetStore(sessions_dir=str(tmp_path / "sessions"))
     app = _make_app(_adapter(db, store))
     async with TestClient(TestServer(app)) as cli:
         with patch("gateway.platforms.api_server.logger") as mock_logger:
@@ -86,9 +85,9 @@ async def test_delete_store_without_forget_sessions_is_skipped(db):
 
 
 @pytest.mark.asyncio
-async def test_delete_forget_exception_never_fails_delete(db):
+async def test_delete_forget_exception_never_fails_delete(db, tmp_path):
     db.create_session("sess-3", "api_server")
-    store = FakeStore(raise_on_forget=True)
+    store = FakeStore(raise_on_forget=True, sessions_dir=str(tmp_path / "sessions"))
     app = _make_app(_adapter(db, store))
     async with TestClient(TestServer(app)) as cli:
         resp = await cli.delete("/api/sessions/sess-3")
@@ -98,8 +97,8 @@ async def test_delete_forget_exception_never_fails_delete(db):
 
 
 @pytest.mark.asyncio
-async def test_delete_unknown_session_404_does_not_call_forget(db):
-    store = FakeStore()
+async def test_delete_unknown_session_404_does_not_call_forget(db, tmp_path):
+    store = FakeStore(sessions_dir=str(tmp_path / "sessions"))
     app = _make_app(_adapter(db, store))
     async with TestClient(TestServer(app)) as cli:
         resp = await cli.delete("/api/sessions/ghost-session")

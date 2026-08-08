@@ -19,6 +19,7 @@ import atexit
 import errno
 import hashlib
 import json
+import tempfile
 import logging
 import os
 import random
@@ -44,7 +45,9 @@ from hermes_constants import get_hermes_home
 from hermes_cli.sqlite_runtime import (
     is_sqlite_wal_reset_vulnerable as _is_sqlite_wal_reset_vulnerable,
 )
+
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple, TypeVar
+
 
 from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     _BRANCH_CHILD_SQL,
@@ -239,6 +242,91 @@ def _delete_delegate_children(conn, parent_ids: List[str]) -> List[str]:
         )
         conn.execute(f"DELETE FROM sessions WHERE id IN ({ph})", ids)
     return ids
+
+
+def _cleanup_async_delegations(
+    conn: sqlite3.Connection,
+    session_ids: Iterable[str],
+    session_keys: Iterable[str],
+) -> int:
+    """Delete durable async-delegation rows referencing deleted sessions.
+
+    ``async_delegations`` has no FK to ``sessions`` (schema in
+    ``hermes_state_common.py``; table is also created lazily by
+    ``tools/async_delegation.py``). A pending/undelivered completion left
+    behind after a delete is re-hydrated on the next boot by
+    ``restore_undelivered_completions``, which re-creates the deleted
+    session to deliver the delegation's result (N3). The session may be
+    referenced by any of the id-typed columns (``origin_ui_session_id``,
+    ``parent_session_id``, ``origin_session_id`` — the raw api_server
+    session id added in a later schema revision) or by ``origin_session``
+    (the routing *key* of the origin session). Runs on the in-flight
+    write transaction's connection; missing table/column on legacy DBs is
+    tolerated (best-effort). Returns the number of rows deleted.
+    """
+    ids = [sid for sid in session_ids if sid]
+    keys = [k for k in session_keys if k]
+    if not ids and not keys:
+        return 0
+    try:
+        conn.execute("SELECT 1 FROM async_delegations LIMIT 1")
+    except sqlite3.DatabaseError:
+        return 0
+    deleted = 0
+    for col in ("origin_ui_session_id", "parent_session_id", "origin_session_id"):
+        if not ids:
+            break
+        ph = ",".join("?" * len(ids))
+        try:
+            cur = conn.execute(
+                f"DELETE FROM async_delegations WHERE {col} IN ({ph})", ids
+            )
+            deleted += cur.rowcount
+        except sqlite3.DatabaseError:
+            pass  # column absent in legacy schema — nothing to clean there
+    if keys:
+        ph = ",".join("?" * len(keys))
+        try:
+            cur = conn.execute(
+                f"DELETE FROM async_delegations WHERE origin_session IN ({ph})",
+                keys,
+            )
+            deleted += cur.rowcount
+        except sqlite3.DatabaseError:
+            pass
+    return deleted
+
+
+def _cleanup_delivery_obligations(
+    conn: sqlite3.Connection, session_keys: Iterable[str]
+) -> int:
+    """Delete delivery-obligation rows for deleted sessions.
+
+    ``delivery_obligations`` (``gateway/delivery_ledger.py`` — same
+    ``state.db``, no FK, table created lazily by the ledger module)
+    records outbound final responses keyed by ``session_key``. A row left
+    behind after a delete is claimed/redelivered on the next gateway
+    restart, delivering the deleted conversation's content into whatever
+    session now owns the key (N5). Runs on the in-flight write
+    transaction's connection; a missing table is tolerated (best-effort).
+    Returns the number of rows deleted.
+    """
+    keys = [k for k in session_keys if k]
+    if not keys:
+        return 0
+    try:
+        conn.execute("SELECT 1 FROM delivery_obligations LIMIT 1")
+    except sqlite3.DatabaseError:
+        return 0
+    ph = ",".join("?" * len(keys))
+    try:
+        cur = conn.execute(
+            f"DELETE FROM delivery_obligations WHERE session_key IN ({ph})", keys
+        )
+        return cur.rowcount
+    except sqlite3.DatabaseError:
+        return 0
+
 
 T = TypeVar("T")
 
@@ -2966,6 +3054,22 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         without a recoverable routing mapping (#59527).
         """
         def _do(conn):
+            # N4 visibility: the ON CONFLICT(id) DO UPDATE below silently
+            # merges an existing row. When the existing row was created by a
+            # different origin than this call, log a warning so a delete +
+            # re-create of the same id (session resurrection) or a
+            # source-mismatched merge becomes visible. (sqlite3 rowcount
+            # cannot distinguish insert vs update for ON CONFLICT DO UPDATE —
+            # both report 1 — so the pre-check reads the existing source.)
+            existing = conn.execute(
+                "SELECT source FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            if existing is not None and existing["source"] != source:
+                logger.warning(
+                    "session upsert merged an existing row: session_id=%s "
+                    "incoming source=%r over existing source=%r",
+                    session_id, source, existing["source"],
+                )
             system_prompt_hash = self._store_system_prompt(conn, system_prompt)
             conn.execute(
                 """INSERT INTO sessions (
@@ -4815,11 +4919,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         the caller already holds cumulative totals (gateway path, where the
         cached agent accumulates across messages).
         """
-        # Ensure the session row exists so the UPDATE doesn't silently affect
-        # 0 rows.  Under concurrent load (cron + kanban + delegate_task) the
-        # initial create_session() may have failed due to SQLite locking.
-        # INSERT OR IGNORE is cheap and idempotent.
-        self._insert_session_row(session_id, "unknown", model=model)
+        # Sessions are born in create_session(); token accounting must NEVER
+        # create a row. A missing row here means the session was deleted (or
+        # never created) — recreating it would resurrect a deleted session
+        # with end_reason=NULL, defeating the GAP-3 backstop (N1). The
+        # UPDATE below simply affects 0 rows in that case and the per-model
+        # usage insert is skipped inside the transaction.
         if absolute:
             sql = """UPDATE sessions SET
                    input_tokens = ?,
@@ -4910,6 +5015,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 "SELECT model, billing_provider, api_call_count FROM sessions WHERE id = ?",
                 (session_id,),
             ).fetchone()
+            if row is None:
+                # Session deleted (or never created) — never recreate it from
+                # token accounting (N1). Queued deltas that were enqueued
+                # before a delete land here after it; dropping them is the
+                # intended behavior, not an error.
+                logger.info(
+                    "token accounting skipped for non-existent session %s "
+                    "(deleted or never created)",
+                    session_id,
+                )
+                return
             existing_model = row["model"] if row is not None else None
             existing_provider = row["billing_provider"] if row is not None else None
             existing_api_calls = int((row["api_call_count"] if row is not None else 0) or 0)
@@ -4994,6 +5110,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             "FROM sessions WHERE id = ?",
             (session_id,),
         ).fetchone()
+        if row is None:
+            # Session deleted (or never created) — never recreate it from
+            # usage accounting (N1); drop the delta instead of inserting an
+            # orphan session_model_usage row or failing an FK.
+            logger.info(
+                "model usage skipped for non-existent session %s "
+                "(deleted or never created)",
+                session_id,
+            )
+            return
         sess_model = row["model"] if row is not None else None
         sess_provider = row["billing_provider"] if row is not None else None
         sess_base_url = row["billing_base_url"] if row is not None else None
@@ -5100,10 +5226,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
         if not session_id or not task:
             return
-        # FK on session_model_usage.session_id → sessions.id: ensure the row
-        # exists (same INSERT OR IGNORE guard update_token_counts uses — the
-        # initial create_session() can fail under concurrent SQLite locking).
-        self._insert_session_row(session_id, "unknown")
+        # session_model_usage has an FK-style relationship to sessions.id
+        # (session_model_usage rows are meaningless without the session). We
+        # deliberately do NOT create the session row here: a missing row
+        # means the session was deleted, and recreating it would resurrect a
+        # deleted session (N1). _record_model_usage no-ops when the row is
+        # gone, so the accounting is simply dropped — matching the
+        # best-effort contract below.
 
         def _do(conn):
             self._record_model_usage(
@@ -5144,12 +5273,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             """, (cutoff,)).fetchall()
             ids = [r[0] if isinstance(r, (tuple, list)) else r["id"] for r in rows]
             if ids:
-                placeholders = ",".join("?" * len(ids))
+                placeholders = ", ".join("?" * len(ids))
                 conn.execute(
                     f"DELETE FROM sessions WHERE id IN ({placeholders})", ids
                 )
                 self._purge_gateway_routing_for_sessions(conn, ids)
+
                 self._delete_unreferenced_system_prompts(conn)
+
             return ids
 
         removed_ids = self._execute_write(_do) or []
@@ -8001,11 +8132,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         )
 
         def _do(conn):
-            cursor = conn.execute(
-                "SELECT 1 FROM sessions WHERE id = ? LIMIT 1", (session_id,)
-            )
-            if cursor.fetchone() is None:
+
+            row = conn.execute(
+                "SELECT session_key FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            if row is None:
+
                 return False
+            session_key = row["session_key"] if row["session_key"] is not None else ""
             if expected_ids is not None:
                 actual_ids = {
                     session_id,
@@ -8022,10 +8156,24 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+
+            # No-FK side tables must die with the session, in the same
+            # transaction: a pending async delegation would otherwise be
+            # re-hydrated on boot (restore_undelivered_completions) and an
+            # undelivered delivery obligation redelivered on restart — both
+            # resurrecting the deleted session (N3/N5). Both helpers are
+            # best-effort (missing table/column tolerated).
+            _cleanup_async_delegations(
+                conn,
+                [session_id, *removed_delegate_ids],
+                [session_key] if session_key else [],
+            )
+            _cleanup_delivery_obligations(conn, [session_key] if session_key else [])
             self._purge_gateway_routing_for_sessions(
                 conn, [session_id, *removed_delegate_ids]
             )
             self._delete_unreferenced_system_prompts(conn)
+
             return True
 
         deleted = self._execute_write(_do)
@@ -8075,7 +8223,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             if cursor.rowcount > 0:
                 self._purge_gateway_routing_for_sessions(conn, [session_id])
+
                 self._delete_unreferenced_system_prompts(conn)
+
             return cursor.rowcount > 0
 
         deleted = self._execute_write(_do)
@@ -8130,10 +8280,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # First, filter to IDs that actually exist — we want to
             # return the real deleted count, not the input length.
             cursor = conn.execute(
-                f"SELECT id FROM sessions WHERE id IN ({placeholders})",
+                f"SELECT id, session_key FROM sessions WHERE id IN ({placeholders})",
                 unique_ids,
             )
-            existing = [row["id"] for row in cursor.fetchall()]
+            rows = cursor.fetchall()
+            existing = [row["id"] for row in rows]
+            existing_keys = [
+                row["session_key"] for row in rows if row["session_key"] is not None
+            ]
             if not existing:
                 return 0
 
@@ -8157,10 +8311,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 f"DELETE FROM sessions WHERE id IN ({existing_placeholders})",
                 existing,
             )
+
+            # Same-transaction cleanup of the no-FK side tables (N3/N5) —
+            # pending async delegations / undelivered delivery obligations
+            # referencing a deleted session must not survive to be restored
+            # on the next boot/restart. Best-effort per helper.
+            _cleanup_async_delegations(conn, existing + removed_delegate_ids, existing_keys)
+            _cleanup_delivery_obligations(conn, existing_keys)
             self._purge_gateway_routing_for_sessions(
                 conn, existing + removed_delegate_ids
             )
             self._delete_unreferenced_system_prompts(conn)
+
             removed_ids.extend(existing)
             return len(existing)
 
@@ -8260,13 +8422,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
                 removed_ids.append(sid)
             self._purge_gateway_routing_for_sessions(conn, removed_ids)
+
             self._delete_unreferenced_system_prompts(conn)
+
             return len(session_ids)
 
         count = self._execute_write(_do)
         self._remove_sessions_json_entries(sessions_dir, removed_ids)
         for sid in removed_ids:
             self._remove_session_files(sessions_dir, sid)
+        self._remove_sessions_json_entries(sessions_dir, removed_ids)
         return count
 
     @staticmethod
@@ -8598,7 +8763,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
                 removed_ids.append(sid)
             self._purge_gateway_routing_for_sessions(conn, removed_ids)
+
             self._delete_unreferenced_system_prompts(conn)
+
             return len(session_ids)
 
         count = self._execute_write(_do)
@@ -8606,6 +8773,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # Clean up on-disk files outside the DB transaction
         for sid in removed_ids:
             self._remove_session_files(sessions_dir, sid)
+        self._remove_sessions_json_entries(sessions_dir, removed_ids)
         return count
 
     def purge_stale_tool_call_markers(

@@ -70,6 +70,25 @@ def _ra():
     return run_agent
 
 
+def _generate_session_id(now: Optional[datetime] = None) -> str:
+    """Mint a session id: ``YYYYMMDD_HHMMSS_<24-bit hex>``.
+
+    The 6-hex suffix is only 24 bits, so the id space is ~33.5M — birthday
+    collisions grow as P ≈ N²/33.5M (~12% at 2,000 sessions). The collision
+    contract is enforced at the persistence layer:
+
+    * ``create_session`` / ``_insert_session_row`` upsert
+      (``ON CONFLICT(id) DO UPDATE``) — never raises on collision; the
+      hermes_state collision warning covers visibility there.
+    * The compression-rotation child is inserted with a *plain* INSERT
+      (``publish_compression_child``) and raises ``sqlite3.IntegrityError``;
+      ``conversation_compression.py`` catches it and retries with a fresh id
+      (max 3 attempts) instead of aborting the boundary.
+    """
+    base = now or datetime.now()
+    return f"{base.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+
+
 def _moa_reference_output_allowed(agent: Any) -> bool:
     """Keep MoA display events off only the machine-readable ``-Q`` surface."""
     return not (
@@ -1491,10 +1510,10 @@ def init_agent(
         # Use provided session ID (e.g., from CLI)
         agent.session_id = session_id
     else:
-        # Generate a new session ID
-        timestamp_str = agent.session_start.strftime("%Y%m%d_%H%M%S")
-        short_uuid = uuid.uuid4().hex[:6]
-        agent.session_id = f"{timestamp_str}_{short_uuid}"
+        # Generate a new session ID (24-bit hex suffix — collision contract
+        # documented in _generate_session_id; persistence-layer retries live
+        # in conversation_compression.py for the plain-INSERT child path).
+        agent.session_id = _generate_session_id(now=agent.session_start)
 
     # Expose session ID to tools (terminal, execute_code) so agents can
     # reference their own session for --resume commands, cross-session

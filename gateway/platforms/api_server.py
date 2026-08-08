@@ -3371,6 +3371,16 @@ class APIServerAdapter(BasePlatformAdapter):
                             (clean_title, session_id),
                         ).fetchone()
                         if conflict:
+                            # Defensive purge (N9): this row was inserted moments
+                            # ago in the same transaction, so it has no messages
+                            # or on-disk files — but under session-id reuse a
+                            # stale gateway_routing entry could still point at
+                            # this id. Purge routing on the in-flight conn (same
+                            # pattern as delete_session) BEFORE deleting the row.
+                            # Do NOT call db.delete_session() here: it opens its
+                            # own BEGIN IMMEDIATE via _execute_write, which fails
+                            # inside this already-open transaction.
+                            db._purge_gateway_routing_for_sessions(conn, [session_id])
                             conn.execute(
                                 "DELETE FROM sessions WHERE id = ?", (session_id,)
                             )

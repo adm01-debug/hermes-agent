@@ -170,7 +170,12 @@ class TestSessionEntryAutoResetRoundtrip:
 def _make_db_mock() -> MagicMock:
     """Return a SessionDB mock with safe defaults for all lookup methods."""
     db = MagicMock()
-    db.get_session.return_value = None
+    db.get_session.return_value = {
+        "id": "sess",
+        "end_reason": None,
+    }  # alive row: end_reason=None; a bare MagicMock (truthy) would make
+    # every session look "ended" and _is_session_ended_in_db would drop the
+    # routing entry even when the reset policy says keep it
     db.get_compression_tip.return_value = None  # avoids MagicMock leaking into session_id
     db.find_latest_gateway_session_for_peer.return_value = None
     db.reopen_session.return_value = None

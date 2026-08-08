@@ -58,6 +58,7 @@ import json
 import logging
 import math
 import os
+import sqlite3
 import tempfile
 import time
 import uuid
@@ -3251,24 +3252,50 @@ def compress_context(
                         _profile_for_child = None
                     old_title = agent._session_db.get_session_title(agent.session_id)
                     old_session_id = agent.session_id
-                    new_session_id = (
-                        f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_"
-                        f"{uuid.uuid4().hex[:6]}"
-                    )
-                    agent._session_db.publish_compression_child(
-                        parent_session_id=old_session_id,
-                        child_session_id=new_session_id,
-                        source=agent.platform
-                        or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
-                        model=agent.model,
-                        model_config=agent._session_init_model_config,
-                        system_prompt=new_system_prompt,
-                        messages=compressed,
-                        cwd=getattr(agent, "working_directory", None),
-                        profile_name=_profile_for_child,
-                        compression_lock_holder=_lock_holder,
-                        require_compression_lease=_lock_holder is not None,
-                    )
+                    # ── Collision-safe child id (N4) ─────────────────────
+                    # publish_compression_child inserts the child row with a
+                    # plain INSERT (see hermes_state.publish_compression_child),
+                    # so a 24-bit hex suffix collision (P ≈ N²/33.5M — ~12% at
+                    # 2,000 sessions) raises sqlite3.IntegrityError and would
+                    # abort compression at the boundary. Retry with a
+                    # regenerated id (fresh timestamp + fresh 24-bit random),
+                    # max 3 attempts. Each attempt runs in its own transaction
+                    # (BEGIN IMMEDIATE + rollback on error), so a failed insert
+                    # leaves no partial child/parent state to clean up.
+                    new_session_id = None
+                    for _child_attempt in range(1, 4):
+                        new_session_id = (
+                            f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_"
+                            f"{uuid.uuid4().hex[:6]}"
+                        )
+                        try:
+                            agent._session_db.publish_compression_child(
+                                parent_session_id=old_session_id,
+                                child_session_id=new_session_id,
+                                source=agent.platform
+                                or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
+                                model=agent.model,
+                                model_config=agent._session_init_model_config,
+                                system_prompt=new_system_prompt,
+                                messages=compressed,
+                                cwd=getattr(agent, "working_directory", None),
+                                profile_name=_profile_for_child,
+                                compression_lock_holder=_lock_holder,
+                                require_compression_lease=_lock_holder is not None,
+                            )
+                            break  # child published — id is durable
+                        except sqlite3.IntegrityError:
+                            if _child_attempt >= 3:
+                                raise
+                            logger.warning(
+                                "Session id collision on compression child "
+                                "(%s); regenerating (attempt %d/3)",
+                                new_session_id,
+                                _child_attempt + 1,
+                            )
+                            # Tiny sleep so a same-second retry gets a fresh
+                            # timestamp, shrinking re-collision odds further.
+                            time.sleep(0.05)
                     agent.session_id = new_session_id
                     try:
                         from gateway.session_context import set_current_session_id
