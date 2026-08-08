@@ -81,6 +81,11 @@ Both are CSS vars in `src/styles.css` — tune in one place, everything inherits
 Don't add per-overlay `shadow-[…]` or `border-(--ui-stroke-secondary)`
 one-offs; if elevation needs to change, change the token.
 
+Every overlay dims the surface beneath it with the shared `scrim-nous`
+utility (`--ui-scrim` fill + blur) — the single source for the dim/blur layer
+behind dialogs, sheets, route overlays, and pickers. Don't hand-roll
+`bg-black/22 backdrop-blur-[0.125rem]` copies.
+
 Menus and popovers use their own shared `shadow-md` +
 `--ui-stroke-secondary` primitive treatment. Drag affordances may use tokenized
 dashed targets and local blur. These are semantic surface classes, not licenses
@@ -95,6 +100,7 @@ for call-site shadow or border inventions.
 | `--stroke-nous` | the overlay hairline (pairs with `shadow-nous`) |
 | `--ui-text-primary / -secondary / -tertiary` | text hierarchy |
 | `--ui-bg-quaternary` | soft control fill (secondary button) |
+| `--ui-scrim` | overlay dim layer (fill of the shared `scrim-nous` utility) |
 | `--chrome-action-hover` | hover fill for quiet controls |
 | `--theme-primary`, `--ui-accent` | brand/accent |
 
@@ -204,11 +210,13 @@ Notes:
 - Respect `AppShell` overlay ownership. Persistent terminal/content layers,
   route overlays, dialogs, and boot surfaces must not compete through ad-hoc
   z-index literals. Pick a rung of the ladder in `styles.css` instead —
-  `--z-modal-backdrop` / `--z-modal` / `--z-modal-popover`, `--z-over-modal`
-  (toasts, tooltips, command surfaces) and `--z-over-modal-content`,
-  `--z-switcher-backdrop` / `--z-switcher`, then the boot chain
-  `--z-connecting` → `--z-onboarding` → `--z-setup` → `--z-crash`. Plain
-  `z-10`/`z-20` are still right for stacking *within* one component.
+  `--z-route-overlay-backdrop` / `--z-route-overlay` (Settings, Command Center,
+  Cron, Profiles, Agents, Starmap — below dialogs), `--z-modal-backdrop` /
+  `--z-modal` / `--z-modal-popover`, `--z-over-modal` (toasts, tooltips,
+  command surfaces) and `--z-over-modal-content`, `--z-switcher-backdrop` /
+  `--z-switcher`, then the boot chain `--z-connecting` → `--z-onboarding` →
+  `--z-setup` → `--z-crash`. Plain `z-10`/`z-20` are still right for stacking
+  *within* one component.
 
 ## Iconography & brand
 

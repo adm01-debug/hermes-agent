@@ -209,6 +209,10 @@
     --z-modal: 130;
     /* A select/dropdown/popover opened from inside a modal, portaled to body. */
     --z-modal-popover: 140;
+    /* Route overlays (Settings, Command Center, Cron, Profiles, Agents,
+       Starmap) cover the app below dialogs, which may open on top of them. */
+    --z-route-overlay-backdrop: 100;
+    --z-route-overlay: 110;
     /* Must clear any open modal: toasts, tooltips, command-surface backdrops. */
     --z-over-modal: 200;
     --z-over-modal-content: 210;
@@ -329,6 +333,9 @@
     --ui-inline-code-background: color-mix(in srgb, #141414 5%, transparent);
     --ui-inline-code-foreground: color-mix(in srgb, #141414 88%, transparent);
     --ui-selection-background: color-mix(in srgb, #ffd24a 55%, transparent);
+    /* Overlay scrim — the single dim/blur layer behind dialogs, sheets, route
+       overlays, and pickers. One source: tune here, every overlay inherits. */
+    --ui-scrim: color-mix(in srgb, #000 22%, transparent);
 
     --dt-background: var(--ui-bg-chrome);
     --dt-foreground: var(--ui-text-primary);
@@ -678,6 +685,13 @@
     background-color: var(--ui-row-hover-background);
     transition: none;
   }
+}
+
+/* Overlay scrim — dim + blur for dialogs, sheets, route overlays, pickers.
+   Replaces per-call-site `bg-black/22 backdrop-blur-[0.125rem]` copies. */
+@utility scrim-nous {
+  background-color: var(--ui-scrim);
+  backdrop-filter: blur(0.125rem);
 }
 
 @keyframes arc-border {
