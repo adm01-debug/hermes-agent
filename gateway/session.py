@@ -1501,6 +1501,14 @@ class SessionStore:
     def _save(self) -> None:
         """Persist the routing index while the caller holds ``_lock``."""
         data, generation = self._snapshot_routing_locked()
+        # Multi-process backstop (#GAP-3): another process (TUI session
+        # delete, second gateway, `hermes sessions delete`) may have deleted
+        # a state.db row this process still tracks.  Drop such dead entries
+        # from the snapshot and from ``_entries`` before persisting so the
+        # save never resurrects them.
+        data, dead = self._prune_dead_persisted_entries(data)
+        if dead:
+            self._drop_entries_locked(dead)
         self._persist_routing_data(data, generation)
 
     def _next_routing_generation_locked(self) -> int:
@@ -1612,7 +1620,16 @@ class SessionStore:
         """Snapshot latest state under ``_lock`` and persist after releasing it."""
         with self._lock:
             data, generation = self._snapshot_routing_locked()
+        # Multi-process backstop (#GAP-3): drop entries whose state.db row
+        # was deleted by another process before persisting, so the save
+        # never resurrects them.  The in-memory drop re-acquires ``_lock``
+        # (unlike ``_save``, the caller does not hold it here).
+        data, dead = self._prune_dead_persisted_entries(data)
+        if dead:
+            with self._lock:
+                self._drop_entries_locked(dead)
         self._persist_routing_data(data, generation)
+
 
     def _save_entry(self, session_key: str) -> None:
         """Persist ONE routing entry via UPSERT — the per-turn fast path.
@@ -1714,6 +1731,158 @@ class SessionStore:
             if fast_persisted is not None:
                 fast_persisted.pop(session_key, None)
 
+
+    def forget_sessions(self, session_ids: List[str]) -> int:
+        """Drop in-memory routing entries whose ``session_id`` is in *session_ids*.
+
+        Contract: called after a session row has been deleted from state.db
+        (e.g. the API ``DELETE /api/sessions/{id}`` flow) so a running
+        gateway does not resurrect the dead session on its next save — the
+        entry would otherwise keep being re-persisted by ``_save`` /
+        ``_save_entries``.
+
+        - Matches entries by ``entry.session_id`` (the routing key is not
+          used for matching, since a key can be re-bound to a new session).
+        - Returns the number of entries actually removed.
+        - Persists the routing index (via ``_save``) only when at least one
+          entry was removed — a no-op match avoids a pointless whole-index
+          rewrite.
+        - Thread-safe: runs under ``self._lock`` and ``_ensure_loaded_locked``.
+        """
+        targets = {sid for sid in session_ids if sid}
+        if not targets:
+            return 0
+        with self._lock:
+            self._ensure_loaded_locked()
+            removed = 0
+            for key in [
+                k for k, e in self._entries.items() if e.session_id in targets
+            ]:
+                del self._entries[key]
+                removed += 1
+            if removed:
+                self._save()
+        return removed
+
+    def _drop_entries_locked(self, dead: Dict[str, str]) -> None:
+        """Remove dead ``{session_key: session_id}`` pairs from ``_entries``.
+
+        Must be called with ``self._lock`` held.  Each key is only dropped
+        when it still maps to the exact dead ``session_id`` observed in the
+        snapshot — a key re-bound to a newer live session (reset/switch)
+        since the snapshot was taken is left untouched.
+        """
+        for key, session_id in dead.items():
+            entry = self._entries.get(key)
+            if entry is not None and entry.session_id == session_id:
+                del self._entries[key]
+
+    def _prune_dead_persisted_entries(
+        self, data: Dict[str, Any]
+    ) -> tuple[Dict[str, Any], Dict[str, str]]:
+        """Filter entries whose state.db row no longer exists from a snapshot.
+
+        Multi-process backstop (#GAP-3): ``SessionEntry.db_persisted`` means
+        a matching row exists in the ``sessions`` table of state.db.  When
+        another process deletes that row, this process's in-memory entry is
+        stale — persisting it again would resurrect the deleted session.
+        This method verifies every ``db_persisted=True`` entry's
+        ``session_id`` still exists via one batched query
+        (``SELECT id FROM sessions WHERE id IN (...)``, 500 ids per chunk)
+        and returns the snapshot with dead entries removed, plus the
+        ``{session_key: session_id}`` pairs that died so callers can also
+        drop them from ``_entries``.
+
+        - Legacy entries (``db_persisted=False``) are never queried and are
+          always preserved — they predate the state.db routing migration and
+          legitimately have no DB row.
+        - If no entry is ``db_persisted``, no DB query is issued at all.
+        - A DB failure never breaks the save: on any exception the snapshot
+          is returned unchanged (dead entries are persisted as before, with
+          a warning logged) — the backstop degrades to a no-op, it never
+          raises.
+        """
+        persisted_ids: Dict[str, str] = {}
+        for key, entry_data in data.items():
+            if not isinstance(entry_data, dict):
+                continue
+            if entry_data.get("db_persisted") and entry_data.get("session_id"):
+                persisted_ids[entry_data["session_id"]] = key
+        if not persisted_ids:
+            return data, {}
+
+        _db = getattr(self, "_db", None)
+        if _db is None:
+            return data, {}
+
+        existing: set[str] = set()
+        try:
+            read_ctx = getattr(_db, "_read_ctx", None)
+            ids = list(persisted_ids.keys())
+            if callable(read_ctx):
+                with read_ctx() as conn:
+                    existing = self._query_existing_session_ids(conn, ids)
+            else:
+                # Fallback: shared writer connection under the SessionDB lock.
+                db_lock = getattr(_db, "_lock", None)
+                conn = getattr(_db, "_conn", None)
+                if conn is None:
+                    return data, {}
+                if db_lock is not None:
+                    with db_lock:
+                        existing = self._query_existing_session_ids(conn, ids)
+                else:
+                    existing = self._query_existing_session_ids(conn, ids)
+        except Exception as exc:
+            logger.warning(
+                "gateway.session: dead-entry backstop query failed; "
+                "persisting %d routing entries unfiltered: %s",
+                len(data),
+                exc,
+            )
+            return data, {}
+
+        dead = {
+            key: sid
+            for sid, key in persisted_ids.items()
+            if sid not in existing
+        }
+        if not dead:
+            return data, {}
+        filtered = {k: v for k, v in data.items() if k not in dead}
+        logger.info(
+            "gateway.session: backstop dropped %d dead persisted entr%s "
+            "from routing save (%d remaining)",
+            len(dead),
+            "y" if len(dead) == 1 else "ies",
+            len(filtered),
+        )
+        return filtered, dead
+
+    @staticmethod
+    def _query_existing_session_ids(
+        conn: Any, session_ids: List[str]
+    ) -> set:
+        """Return the subset of *session_ids* that still have rows.
+
+        Runs ``SELECT id FROM sessions WHERE id IN (...)`` in chunks of 500
+        ids to stay well under SQLite's variable-number limit.  *conn* is
+        expected to use ``sqlite3.Row`` (both SessionDB read/write paths do).
+        """
+        existing: set = set()
+        for i in range(0, len(session_ids), 500):
+            chunk = session_ids[i : i + 500]
+            placeholders = ",".join("?" * len(chunk))
+            rows = conn.execute(
+                f"SELECT id FROM sessions WHERE id IN ({placeholders})", chunk
+            ).fetchall()
+            for row in rows:
+                try:
+                    existing.add(row["id"])
+                except (KeyError, IndexError, TypeError):
+                    existing.add(row[0])
+        return existing
+ 
     def _resolve_profile_for_key(self, source: Optional[SessionSource] = None) -> Optional[str]:
         """Return the profile namespace for session keys, or None when off.
 

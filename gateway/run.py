@@ -10981,6 +10981,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter.set_message_handler(self._primary_message_handler())
             adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
             adapter.set_session_store(self.session_store)
+            # GAP-2 defense: SessionStore is created in __init__ (L3439)
+            # before any adapter exists; set_session_store (base.py L3387)
+            # lands it on the adapter HERE, before connect() at L8489 starts
+            # serving requests. api_server handlers read it via
+            # getattr(self, "_session_store") (api_server.py ~L3274). This
+            # assert turns a future reorder into a loud boot failure instead
+            # of a silent session-lookup regression.
+            assert getattr(adapter, "_session_store", None) is self.session_store, (
+                f"{platform.value}: SessionStore not wired to adapter before connect"
+            )
             adapter.set_busy_session_handler(self._handle_active_session_busy_message)
             _set_reaction = getattr(adapter, "set_reaction_handler", None)
             if callable(_set_reaction):
@@ -12353,6 +12363,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     adapter.set_message_handler(self._primary_message_handler())
                     adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
                     adapter.set_session_store(self.session_store)
+                    # GAP-2 defense (reconnect path — new adapter object).
+                    assert getattr(adapter, "_session_store", None) is self.session_store, (
+                        f"{platform.value}: SessionStore not wired to adapter before connect"
+                    )
                     adapter.set_busy_session_handler(self._handle_active_session_busy_message)
                     _set_reaction = getattr(adapter, "set_reaction_handler", None)
                     if callable(_set_reaction):
@@ -13295,6 +13309,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._make_profile_fatal_error_handler(profile_name, platform)
         )
         adapter.set_session_store(self.session_store)
+        # GAP-2 defense (secondary-profile path — new adapter object).
+        assert getattr(adapter, "_session_store", None) is self.session_store, (
+            f"{platform.value}: SessionStore not wired to adapter before connect"
+        )
         adapter.set_busy_session_handler(self._handle_active_session_busy_message)
         _set_reaction = getattr(adapter, "set_reaction_handler", None)
         if callable(_set_reaction):
@@ -13684,6 +13702,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return None
             adapter = APIServerAdapter(config)
             adapter.gateway_runner = self
+            # The SessionStore is NOT wired here: the caller does it via
+            # set_session_store() right after _create_adapter returns
+            # (startup L8471 / reconnect L9571 / profile L10505), always
+            # before connect(). api_server reads it as ``_session_store``.
             return adapter
 
         elif platform == Platform.WEBHOOK:

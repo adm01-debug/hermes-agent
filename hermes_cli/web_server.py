@@ -11306,6 +11306,50 @@ async def _auto_archive_ticker_loop(
 
 
 
+# Architecture note — multi-process delete contract (serve has no SessionStore):
+# This process never hosts a SessionStore (grep SessionStore in this file: none);
+# it writes state.db directly via SessionDB and only the gateway process
+# (``hermes gateway run``, gateway/session.py) keeps in-memory routing entries
+# keyed by messaging session_key. A desktop DELETE therefore cannot resurrect
+# anything by itself — the only resurrection risk is the gateway re-persisting
+# an entry it still holds. That case is covered by the #GAP-3 multi-process
+# backstop inside SessionStore: every save runs _prune_dead_persisted_entries
+# (gateway/session.py:_save), which drops any entry whose state.db row is gone
+# (db_persisted=True + row missing) from the snapshot and from _entries before
+# persisting, so the next gateway save never re-creates the deleted session_id
+# in gateway_routing or the sessions.json mirror. Routing cleanup here is
+# synchronous and transactional: SessionDB.delete_session purges gateway_routing
+# rows whose embedded session_id matches inside the same write transaction
+# (_purge_gateway_routing_for_sessions, hermes_state.py), so no RPC to the
+# gateway (session.close etc.) is needed — the staleness detection is
+# data-driven over the shared state.db.
+@app.delete("/api/sessions/{session_id}")
+async def delete_session_endpoint(session_id: str, profile: Optional[str] = None):
+    # ``profile`` deletes a session belonging to another (local) profile by
+    # opening its state.db directly. Remote profiles never reach here — the
+    # desktop routes their DELETE to the remote backend. Omit for current/default.
+    def _delete():
+        db = _open_session_db_for_profile(profile)
+        try:
+            # Resolve exact ids / unique prefixes like every other session endpoint
+            # (detail, messages, rename, export all do). A session that no longer
+            # exists is an idempotent success: DELETE's contract is "ensure it's
+            # gone", and the desktop optimistically removes the row then RESTORES it
+            # on any error — so a 404 on an already-absent row resurrected a ghost
+            # row and surfaced "session not found". /goal + auto-compression churn
+            # leaves transient empty rows (reaped by empty-session hygiene) that
+            # race the sidebar snapshot, which is exactly when this fired. Mirrors
+            # the bulk-delete endpoint, which already treats ghost ids as success.
+            sid = db.resolve_session_id(session_id)
+            if not sid:
+                return {"ok": True, "already_absent": True}
+            db.delete_session(sid, sessions_dir=_profile_sessions_dir(profile))
+            return {"ok": True}
+        finally:
+            db.close()
+
+    return await asyncio.to_thread(_delete)
+
 
 
 
