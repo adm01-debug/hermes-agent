@@ -4332,6 +4332,28 @@ class TurnRunner:
                 "run_agent resolved: model=%s provider=%s session=%s",
                 model, runtime_kwargs.get("provider"), ctx.session_key or "",
             )
+            # Workspace model override: takes effect when no /model session
+            # override is active.  On /new, session overrides are cleared,
+            # so workspace model kicks back in automatically.
+            if ctx.workspace_model:
+                resolved_session_key = ctx.session_key
+                if not resolved_session_key and ctx.source is not None:
+                    try:
+                        resolved_session_key = self._runner._session_key_for_source(ctx.source)
+                    except Exception:
+                        resolved_session_key = None
+                session_override = self._runner._session_model_overrides.get(resolved_session_key) if resolved_session_key else None
+                if not session_override:
+                    logger.info(
+                        "Workspace model override: session=%s config_model=%s -> workspace_model=%s",
+                        resolved_session_key or "", model, ctx.workspace_model,
+                    )
+                    model = ctx.workspace_model
+                else:
+                    logger.debug(
+                        "Session /model override takes priority over workspace model: session=%s override=%s workspace=%s",
+                        resolved_session_key or "", session_override.get("model", "?"), ctx.workspace_model,
+                    )
         except Exception as exc:
             return {
                 "final_response": f"⚠️ Provider authentication failed: {exc}",
@@ -14154,6 +14176,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 reply_to_is_own_message=event.reply_to_is_own_message,
                 auto_skill=event.auto_skill,
                 channel_prompt=event.channel_prompt,
+                workspace_model=getattr(event, 'workspace_model', None),
                 channel_context=event.channel_context,
                 internal=event.internal,
                 timestamp=event.timestamp,
@@ -14185,6 +14208,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     source=event.source,
                     message_id=event.message_id,
                     channel_prompt=event.channel_prompt,
+                    workspace_model=getattr(event, 'workspace_model', None),
                     channel_context=event.channel_context,
                 )
                 self._enqueue_fifo(quick_key, queued_event, adapter)
@@ -14208,6 +14232,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 source=event.source,
                 message_id=event.message_id,
                 channel_prompt=event.channel_prompt,
+                workspace_model=getattr(event, 'workspace_model', None),
                 channel_context=event.channel_context,
             )
             self._enqueue_fifo(quick_key, queued_event, adapter)
@@ -14246,6 +14271,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         7. Return response
         """
         source = event.source
+
+        # Workspace resolution — SHARED path (review fix): folder-based
+        # workspaces apply for EVERY platform (Discord, Slack, CLI, TUI, ...),
+        # not just Telegram.  Idempotent: adapters that already resolved
+        # (``_workspace_applied`` flag) are skipped.
+        try:
+            from agent.workspace_resolver import apply_workspace_to_event
+            apply_workspace_to_event(event)
+        except Exception:
+            logger.debug("Workspace resolution skipped for %s", source.platform if source else "?", exc_info=True)
 
         # 🔴 Cross-session leak guard. This handler runs inside a per-message
         # asyncio task created via create_task(), which snapshots the spawning
@@ -15111,6 +15146,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "personality":
             return await self._handle_personality_command(event)
+
+        if canonical == "workspace":
+            return await self._handle_workspace_command(event)
 
         if canonical == "kanban":
             return await self._handle_kanban_command(event)
@@ -17421,6 +17459,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 run_generation=run_generation,
                 event_message_id=self._reply_anchor_for_event(event),
                 channel_prompt=event.channel_prompt,
+                workspace_model=getattr(event, 'workspace_model', None),
                 moa_config=getattr(event, "_moa_config", None),
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
@@ -18173,21 +18212,44 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         inside this method, so contextvars behave correctly in the worker
         thread.
         """
+        workspace_model = None
+        try:
+            from agent.workspace_resolver import resolve_workspace
+            ws = resolve_workspace(
+                source.platform.value if source.platform else "",
+                str(source.chat_id or ""),
+                str(source.thread_id) if getattr(source, "thread_id", None) else None,
+            )
+            workspace_model = ws.model
+        except Exception:
+            pass
         if getattr(getattr(self, "config", None), "multiplex_profiles", False):
             with _profile_runtime_scope(self._resolve_profile_home_for_source(source)):
-                return self._format_session_info()
-        return self._format_session_info()
+                return self._format_session_info(workspace_model=workspace_model)
+        return self._format_session_info(workspace_model=workspace_model)
 
-    def _format_session_info(self) -> str:
+    def _format_session_info(self, workspace_model: Optional[str] = None) -> str:
         """Resolve current model config and return a formatted info block.
 
         Surfaces model, provider, context length, and endpoint so gateway
         users can immediately see if context detection went wrong (e.g.
         local models falling to the 128K default).
+
+        When *workspace_model* is provided, the display shows the effective
+        model (workspace override if no /model session override is active)
+        rather than the config default, so gateway users see which model
+        will actually be used.
         """
         from agent.model_metadata import get_model_context_length, DEFAULT_FALLBACK_CONTEXT
 
-        model = _resolve_gateway_model()
+        config_model = _resolve_gateway_model()
+        effective_model = model = config_model
+        # If a workspace model is provided and differs from the config default,
+        # use it as the effective model so the user sees what will actually run.
+        model_source = "config"
+        if workspace_model and workspace_model != config_model:
+            effective_model = model = workspace_model
+            model_source = "workspace"
         config_context_length = None
         provider = None
         base_url = None
@@ -18287,7 +18349,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             ctx_display = str(context_length)
 
         lines = [
-            f"◆ Model: `{model}`",
+            f"◆ Model: `{effective_model}`{' (workspace)' if model_source == 'workspace' else ''}",
             f"◆ Provider: {provider or 'openrouter'}",
             f"◆ Context: {ctx_display} tokens ({ctx_source})",
         ]
@@ -23894,6 +23956,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None,
+        workspace_model: Optional[str] = None,
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
@@ -23913,7 +23976,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 message, context_prompt, history, source, session_id,
                 session_key=session_key, run_generation=run_generation,
                 _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
-                channel_prompt=channel_prompt, moa_config=moa_config,
+                channel_prompt=channel_prompt, workspace_model=workspace_model, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=message_type,
@@ -24047,6 +24110,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None,
+        workspace_model: Optional[str] = None,
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
@@ -24333,6 +24397,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _interrupt_depth=_interrupt_depth,
             event_message_id=event_message_id,
             moa_config=moa_config,
+            workspace_model=workspace_model,
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
         )
@@ -24600,10 +24665,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception as _stts_err:
                 logger.debug("Could not set up streaming TTS consumer: %s", _stts_err)
 
+
         # run_sync extracted to TurnRunner.run_sync (bound method; the
         # executor call below is unchanged).  Its closed-over locals travel
         # on turn_ctx; `nonlocal message` rebinds became ctx.message writes.
         run_sync = turn_runner.run_sync
+
         
         # Start progress message sender if enabled. Gate on needs_progress_queue
         # (tool_progress OR thinking_progress), not tool_progress alone: the
@@ -25454,6 +25521,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 next_message = pending
                 next_message_id = None
                 next_channel_prompt = None
+                next_workspace_model = None
                 next_session_key = session_key
                 # #60671 — carry the pending event's message_type into the
                 # recursive call so queued voice turns can stream TTS and
@@ -25490,6 +25558,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         return result
                     next_message_id = self._reply_anchor_for_event(pending_event)
                     next_channel_prompt = getattr(pending_event, "channel_prompt", None)
+                    next_workspace_model = getattr(pending_event, "workspace_model", None)
                     next_message_type = getattr(pending_event, "message_type", None)
 
                 # Clear the completed streaming marker from the prior logical
@@ -25545,6 +25614,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
+                    workspace_model=next_workspace_model,
                     message_type=next_message_type,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)

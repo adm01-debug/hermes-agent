@@ -1566,6 +1566,13 @@ def load_gateway_config() -> GatewayConfig:
                     bridged["exclusive_bot_mentions"] = platform_cfg["exclusive_bot_mentions"]
                 if plat == Platform.TELEGRAM and "observe_unmentioned_group_messages" in platform_cfg:
                     bridged["observe_unmentioned_group_messages"] = platform_cfg["observe_unmentioned_group_messages"]
+                if plat == Platform.TELEGRAM:
+                    # Bridge Telegram topic config from top-level to extra
+                    # so users can write: telegram: { group_topics: [...] }
+                    # instead of: telegram: { extra: { group_topics: [...] } }
+                    for _topic_key in ("group_topics", "dm_topics"):
+                        if _topic_key in platform_cfg:
+                            bridged[_topic_key] = platform_cfg[_topic_key]
                 if "dm_policy" in platform_cfg:
                     bridged["dm_policy"] = platform_cfg["dm_policy"]
                 if "allow_from" in platform_cfg:
