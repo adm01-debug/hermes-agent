@@ -56,15 +56,57 @@ class _TrackedLock:
         return self._held
 
 
+class _FakeCursor:
+    """Fake sqlite cursor returning pre-built rows."""
+
+    def __init__(self, rows):
+        self._rows = rows
+
+    def fetchall(self):
+        return self._rows
+
+
+class _FakeConn:
+    """Fake connection for the #GAP-3 backstop read path."""
+
+    def __init__(self, rows):
+        self._rows = rows
+
+    def execute(self, sql, params=None):
+        # Mirrors _query_existing_session_ids: SELECT id FROM sessions
+        # WHERE id IN (...) — return only ids that exist in the mock store.
+        ids = params if isinstance(params, (list, tuple)) else []
+        return _FakeCursor([{"id": sid} for sid in ids if sid in self._rows])
+
+
+class _FakeReadCtx:
+    """Context manager standing in for SessionDB._read_ctx."""
+
+    def __init__(self, rows):
+        self._rows = rows
+
+    def __enter__(self):
+        return _FakeConn(self._rows)
+
+    def __exit__(self, *exc):
+        return False
+
+
 def _db_with_rows(rows: dict) -> MagicMock:
     """Mock SessionDB where ``get_session`` maps session_id -> row dict."""
     db = MagicMock()
     db.get_session.side_effect = lambda sid: rows.get(sid)
     db.find_latest_gateway_session_for_peer.return_value = None
     db.reopen_session.return_value = None
-    db.create_session.return_value = None
+    db.create_session.side_effect = lambda **kwargs: rows.setdefault(
+        kwargs["session_id"], {"id": kwargs["session_id"], "end_reason": None}
+    )
     # Identity compression tip (no child session).
     db.get_compression_tip.side_effect = lambda sid: sid
+    # The #GAP-3 backstop (_prune_dead_persisted_entries) reads existence
+    # through _read_ctx; without a faithful fake it sees an empty store and
+    # drops the just-created entry as "dead". Mirror the real DB.
+    db._read_ctx.side_effect = lambda: _FakeReadCtx(rows)
     return db
 
 
@@ -123,10 +165,10 @@ class TestStaleCheckOutsideLock:
 
         orig = store._is_session_ended_in_db
 
-        def tracking(sid, **kw):
+        def tracking(sid, **kwargs):
             if lock.held:
                 calls_under_lock.append(sid)
-            return orig(sid, **kw)
+            return orig(sid, **kwargs)
 
         store._is_session_ended_in_db = tracking  # type: ignore[method-assign]
 
@@ -227,6 +269,33 @@ def test_concurrent_same_key_returns_one_published_session(tmp_path):
     assert created_ids == {entries[0].session_id}
 
 
+def test_concurrent_force_new_returns_one_published_session(tmp_path):
+    """Concurrent /new delivery must not create orphan SQLite sessions."""
+    source = _source()
+    db = _db_with_rows({})
+    store = _make_store(tmp_path, db)
+    owner_started = threading.Event()
+    release_owner = threading.Event()
+    original_impl = store._get_or_create_session_impl
+
+    def synchronized_impl(*args, **kwargs):
+        owner_started.set()
+        assert release_owner.wait(timeout=10)
+        return original_impl(*args, **kwargs)
+
+    store._get_or_create_session_impl = synchronized_impl  # type: ignore[method-assign]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        owner = pool.submit(store.get_or_create_session, source, True)
+        assert owner_started.wait(timeout=10)
+        follower = pool.submit(store.get_or_create_session, source, True)
+        release_owner.set()
+        entries = [owner.result(timeout=10), follower.result(timeout=10)]
+
+    assert entries[0] is entries[1]
+    created_ids = {call.kwargs["session_id"] for call in db.create_session.call_args_list}
+    assert created_ids == {entries[0].session_id}
+
+
 def test_auto_reset_does_not_recover_session_being_ended(tmp_path):
     source = _source()
     db = _db_with_rows({})
@@ -254,3 +323,109 @@ def test_auto_reset_does_not_recover_session_being_ended(tmp_path):
     db.end_session.assert_not_called()
 
 
+def test_legacy_and_off_lock_saves_share_one_serialization_lock(tmp_path):
+    db = _db_with_rows({})
+    persisted: dict[str, str] = {}
+    first_write_started = threading.Event()
+    release_first_write = threading.Event()
+    write_count = 0
+    count_lock = threading.Lock()
+
+    def replace(entries, *, scope):
+        nonlocal write_count, persisted
+        with count_lock:
+            write_count += 1
+            call_number = write_count
+        if call_number == 1:
+            first_write_started.set()
+            assert release_first_write.wait(timeout=10)
+        persisted = dict(entries)
+
+    db.replace_gateway_routing_entries.side_effect = replace
+    store = _make_store(tmp_path, db)
+    source_a = _source()
+    source_b = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="67890",
+        chat_type="dm",
+        user_id="67890",
+    )
+    key_a = store._generate_session_key(source_a)
+    key_b = store._generate_session_key(source_b)
+    _seed_entry(store, key_a, "sid-a")
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        future_a = pool.submit(store._save_entries)
+        assert first_write_started.wait(timeout=10)
+        _seed_entry(store, key_b, "sid-b")
+        future_b = pool.submit(store._save)
+        release_first_write.set()
+        future_a.result(timeout=10)
+        future_b.result(timeout=10)
+
+    assert set(persisted) == {key_a, key_b}
+
+
+def test_save_serialization_snapshots_latest_routing_index(tmp_path):
+    """A delayed earlier writer must snapshot the state visible when it writes."""
+    db = _db_with_rows({})
+    persisted: dict[str, str] = {}
+    first_write_started = threading.Event()
+    release_first_write = threading.Event()
+    write_count = 0
+    count_lock = threading.Lock()
+
+    def replace(entries, *, scope):
+        nonlocal write_count, persisted
+        with count_lock:
+            write_count += 1
+            call_number = write_count
+        if call_number == 1:
+            first_write_started.set()
+            assert release_first_write.wait(timeout=10)
+        persisted = dict(entries)
+
+    db.replace_gateway_routing_entries.side_effect = replace
+    store = _make_store(tmp_path, db)
+    source_a = _source()
+    source_b = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="67890",
+        chat_type="dm",
+        user_id="67890",
+    )
+    key_a = store._generate_session_key(source_a)
+    key_b = store._generate_session_key(source_b)
+    entry_a = _seed_entry(store, key_a, "sid-a")
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        future_a = pool.submit(store._save_entries)
+        assert first_write_started.wait(timeout=10)
+        entry_b = _seed_entry(store, key_b, "sid-b")
+        future_b = pool.submit(store._save_entries)
+        release_first_write.set()
+        future_a.result(timeout=10)
+        future_b.result(timeout=10)
+
+    assert set(store._entries) == {key_a, key_b}
+    assert set(persisted) == {key_a, key_b}
+    assert json.loads(persisted[key_a])["session_id"] == entry_a.session_id
+    assert json.loads(persisted[key_b])["session_id"] == entry_b.session_id
+
+
+def test_recovery_rejects_other_profile_row(tmp_path, monkeypatch):
+    """The lock-free recovery path must retain the canonical profile guard."""
+    source = _source()
+    db = _db_with_rows({})
+    db.find_latest_gateway_session_for_peer.return_value = {
+        "id": "foreign-session",
+        "session_key": "agent:other:telegram:dm:12345",
+        "started_at": datetime.now().timestamp(),
+    }
+    store = _make_store(tmp_path, db)
+    monkeypatch.setattr(store, "_active_profile_name", lambda: "default")
+
+    entry = store.get_or_create_session(source)
+
+    assert entry.session_id != "foreign-session"
+    db.reopen_session.assert_not_called()

@@ -369,12 +369,24 @@ class SessionSchemaMixin:
                         )
                     except sqlite3.OperationalError as exc:
                         # Expected: "duplicate column name" from a race or
-                        # re-run.  Unexpected: "Cannot add a NOT NULL column
-                        # with default value NULL" from a schema mistake.
-                        # Log at DEBUG so it's visible in agent.log.
-                        logger.debug(
-                            "reconcile %s.%s: %s", table_name, col_name, exc,
-                        )
+                        # re-run — the column already exists, so the ADD is
+                        # a no-op and idempotence is preserved. Keep this at
+                        # DEBUG so normal startups stay quiet.
+                        msg = str(exc).lower()
+                        if "duplicate column" in msg or "already exists" in msg:
+                            logger.debug(
+                                "reconcile %s.%s: %s", table_name, col_name, exc,
+                            )
+                        else:
+                            # Unexpected: a real schema mistake (e.g. "Cannot
+                            # add a NOT NULL column with default value NULL"
+                            # from a bad SCHEMA_SQL entry). This must never be
+                            # swallowed silently — log ERROR with the column
+                            # and the full traceback.
+                            logger.exception(
+                                "reconcile %s.%s: failed to add column (type=%s): %s",
+                                table_name, col_name, col_type, exc,
+                            )
 
     def _heal_gateway_routing_pk(self, cursor: sqlite3.Cursor) -> None:
         """Rebuild ``gateway_routing`` when its PRIMARY KEY predates scoping.

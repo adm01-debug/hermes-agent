@@ -2107,6 +2107,10 @@ class MessageEvent:
     # Applied at API call time and never persisted to transcript history.
     channel_prompt: Optional[str] = None
 
+    # Workspace-specified model override.  Takes effect on every message
+    # (including after /new resets).  Priority: /model command > workspace > config.
+    workspace_model: Optional[str] = None
+
     # Channel context recovered by history backfill (e.g. messages between
     # bot turns that were missed due to require_mention).  Kept separate
     # from ``text`` so the sender-prefix logic in run.py can operate on the
@@ -3405,11 +3409,21 @@ class BasePlatformAdapter(ABC):
     
     def set_session_store(self, session_store: Any) -> None:
         """
-        Set the session store for checking active sessions.
-        
-        Used by adapters that need to check if a thread/conversation
-        has an active session before processing messages (e.g., Slack
-        thread replies without explicit mentions).
+        set_session_store(storage) — chamado pelo gateway runner no startup
+        (gateway/run.py: startup, reconnect e _configure_profile_adapter);
+        usado pelo api_server para podar entries em memória após deletes
+        (api_server lê ``self._session_store`` via getattr e chama
+        ``forget_sessions`` quando uma sessão é apagada pela API).
+
+        Também usado por adapters que precisam checar se uma
+        thread/conversação tem sessão ativa antes de processar mensagens
+        (e.g., Slack thread replies sem menção explícita) e para resolver
+        o diretório de sessões a partir do SessionStore vivo.
+
+        Garantia de ordem: o runner instancia ``self.session_store`` no
+        ``__init__`` (antes de conectar qualquer adapter), então todo
+        adapter — incluindo o APIServerAdapter — recebe o store antes de
+        qualquer request de delete chegar.
         """
         self._session_store = session_store
     

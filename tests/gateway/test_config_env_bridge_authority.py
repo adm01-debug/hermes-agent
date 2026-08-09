@@ -55,10 +55,26 @@ def _run_gateway_import(hermes_home: Path, initial_env: dict[str, str]) -> dict[
                 print(f"{{k}}={{v}}")
         """
     )
-    env = dict(initial_env)
+    # Start from the FULL parent environment so the subprocess gets a
+    # functional OS environment.  A minimal {}-based env breaks on Windows:
+    # Winsock cannot initialize without SystemRoot/windir etc., so
+    # ``import gateway.run`` dies with WinError 10106 ("requested service
+    # provider could not be loaded or initialized").
+    #
+    # Every HERMES_* key is scrubbed first: the bridge must source those
+    # values exclusively from the .env / config.yaml under hermes_home —
+    # never from the parent process — which is exactly what the tests below
+    # verify.
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if not k.startswith("HERMES_")
+    }
+    env.update(initial_env)
     env["HERMES_HOME"] = str(hermes_home)
-    # Keep PATH / PYTHONPATH so venv imports resolve.
-    for k in ("PATH", "PYTHONPATH", "VIRTUAL_ENV", "HOME"):
+    # Keep PATH / PYTHONPATH so venv imports resolve (already present in
+    # the copy above; kept explicit for clarity).
+    for k in ("PATH", "PYTHONPATH", "VIRTUAL_ENV"):
         if k in os.environ and k not in env:
             env[k] = os.environ[k]
 

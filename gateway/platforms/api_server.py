@@ -3371,6 +3371,16 @@ class APIServerAdapter(BasePlatformAdapter):
                             (clean_title, session_id),
                         ).fetchone()
                         if conflict:
+                            # Defensive purge (N9): this row was inserted moments
+                            # ago in the same transaction, so it has no messages
+                            # or on-disk files — but under session-id reuse a
+                            # stale gateway_routing entry could still point at
+                            # this id. Purge routing on the in-flight conn (same
+                            # pattern as delete_session) BEFORE deleting the row.
+                            # Do NOT call db.delete_session() here: it opens its
+                            # own BEGIN IMMEDIATE via _execute_write, which fails
+                            # inside this already-open transaction.
+                            db._purge_gateway_routing_for_sessions(conn, [session_id])
                             conn.execute(
                                 "DELETE FROM sessions WHERE id = ?", (session_id,)
                             )
@@ -3447,6 +3457,36 @@ class APIServerAdapter(BasePlatformAdapter):
 
         sessions_dir = Path(get_hermes_home()) / "sessions"
         deleted = await asyncio.to_thread(db.delete_session, session_id, sessions_dir)
+
+        # If the row was actually deleted (not already absent), drop the
+        # in-memory entry from the live SessionStore so a running gateway
+        # does not resurrect the dead session on the next save. forget_sessions
+        # may not exist yet while gateway/session.py is being upgraded, so
+        # probe defensively and never propagate store failures to the caller.
+        if deleted:
+            store = getattr(self, "_session_store", None)
+            if store is not None:
+                try:
+                    forget = getattr(store, "forget_sessions", None)
+                    if callable(forget):
+                        forgotten = await asyncio.to_thread(forget, [session_id])
+                        logger.info(
+                            "forget_sessions removed %s in-memory entr%s for deleted session %s after API delete",
+                            forgotten,
+                            "y" if forgotten == 1 else "ies",
+                            session_id,
+                        )
+                    else:
+                        logger.debug(
+                            "SessionStore has no forget_sessions yet; skipped in-memory forget for deleted session %s",
+                            session_id,
+                        )
+                except Exception:
+                    logger.warning(
+                        "Failed to forget session %s from SessionStore after API delete",
+                        session_id,
+                        exc_info=True,
+                    )
         return web.json_response({"object": "hermes.session.deleted", "id": session_id, "deleted": bool(deleted)})
 
     async def _handle_session_messages(self, request: "web.Request") -> "web.Response":
