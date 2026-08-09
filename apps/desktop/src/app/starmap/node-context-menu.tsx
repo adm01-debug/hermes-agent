@@ -110,12 +110,12 @@ export function NodeContextMenu({ onClose, onNodeRemoved, target }: NodeContextM
     <>
       {menuOpen ? (
         <>
-          <div className="fixed inset-0 z-50" onClick={onClose} onContextMenu={e => e.preventDefault()} />
+          <div className="fixed inset-0 z-(--z-modal-backdrop)" onClick={onClose} onContextMenu={e => e.preventDefault()} />
           {/* Styled to DropdownMenuContent/Item scale (rounded-lg card, p-1,
               text-xs rows) — the hand-rolled fixed positioning stays because
               the target is a canvas point, not a DOM anchor. */}
           <div
-            className="fixed z-50 min-w-36 rounded-lg border border-(--ui-stroke-secondary) bg-[color-mix(in_srgb,var(--ui-bg-elevated)_96%,transparent)] p-1 shadow-md backdrop-blur-md"
+            className="fixed z-(--z-modal-popover) min-w-36 rounded-lg border border-(--ui-stroke-secondary) bg-[color-mix(in_srgb,var(--ui-bg-elevated)_96%,transparent)] p-1 shadow-md backdrop-blur-md"
             style={{ left: target.x, top: target.y }}
           >
             <div className="truncate px-2 py-1 text-[0.68rem] text-muted-foreground">{target.label}</div>
